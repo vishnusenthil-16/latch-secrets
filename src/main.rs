@@ -1,4 +1,5 @@
 mod bw;
+mod capabilities;
 mod config;
 mod session;
 mod vault;
@@ -34,6 +35,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Describe the agent interface without configuration or authentication.
+    Capabilities,
     /// Configure an isolated vault and install the macOS desktop session helper.
     Configure {
         #[arg(long)]
@@ -109,6 +112,10 @@ fn output(value: Value, json_output: bool) {
 }
 
 fn execute(cli: &Cli) -> Result<()> {
+    if matches!(cli.command, Action::Capabilities) {
+        output(capabilities::manifest(), cli.json);
+        return Ok(());
+    }
     let state = config::State::new(cli.state_dir.clone())?;
     if matches!(cli.command, Action::SessionServe) {
         return session::serve(&state.root);

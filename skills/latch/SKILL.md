@@ -7,6 +7,8 @@ description: Discover vault item metadata and inject selected credentials into c
 
 Use the installed `latch` command. Authentication and session storage belong to the CLI; never implement them in a skill, shell wrapper, or conversation.
 
+Inspect `latch capabilities --json` for the installed CLI's versioned interface, supported commands, selectors, and output conventions. This requires no configuration or login and does not indicate vault readiness. If an older CLI lacks this command, use `latch --help`.
+
 1. Inspect `latch status --json`; use `latch doctor --json` to diagnose readiness. Do not treat exit 0 alone as an unlocked vault.
 2. If login is needed, ask the user to run `latch login` in their terminal. Never request passwords, API secrets, or session tokens in chat.
 3. Call `latch sync` when the task requires current server data, then `latch list --search NAME --json` to find an exact item UUID. Listing is metadata only.

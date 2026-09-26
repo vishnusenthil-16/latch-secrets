@@ -131,12 +131,23 @@ Files are snapshots: rerun `write` after rotating credentials. New interactive z
 
 The optional [Latch skill](skills/latch/SKILL.md) documents discovery and injection for agents. It delegates authentication and session handling to the CLI.
 
+Any agent with process execution can inspect Latch's interface before setup:
+
+```sh
+latch capabilities --json
+```
+
+This read-only command needs no configuration, Bitwarden installation, session helper, or login. It returns `schema_version`, the installed Latch `version`, public command descriptions and usage, authentication requirements, credential selectors, delivery modes, and output/error conventions. It never reads vault data or reports live readiness; use `status` or `doctor` for that.
+
+The capability format starts at `schema_version: 1`. Consumers should ignore unknown fields and reject unsupported schema versions. Additive fields may be introduced within a schema version; incompatible changes require a new version. `ITEM_UUID`, `NAME`, `command`, and `args` in examples are placeholders. Operational errors currently share the `LATCH_ERROR` code; CLI syntax errors remain text even with `--json`.
+
 Use `--json` for machine-readable results. Never retrieve credentials into a conversation or use a child command that prints its environment.
 
 ## Command reference
 
 | Command | Purpose |
 | --- | --- |
+| `capabilities` | Describe the agent interface without configuration or authentication |
 | `configure` | Save connection settings and install or restart the desktop session helper |
 | `login` | Authenticate or unlock interactively and store the session in Keychain |
 | `status` | Report configuration, session accessibility, vault state, and last sync |
