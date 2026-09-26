@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+import time
 
 from verify_release import verify
+
+DRAFT_VISIBILITY_ATTEMPTS = 7
+DRAFT_VISIBILITY_DELAY_SECONDS = 5
 
 
 def gh(*args: str) -> subprocess.CompletedProcess[str]:
@@ -36,7 +40,14 @@ def publish(bundle: Path, tag: str, repository: str) -> None:
     if release is None:
         gh("release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
            "--title", f"Latch {tag}", "--notes", "macOS source release with Homebrew formula.")
-        release = find_release(repository, tag)
+        # GitHub may acknowledge draft creation before its paginated release
+        # list includes it. Retry only this post-create visibility gap.
+        for attempt in range(DRAFT_VISIBILITY_ATTEMPTS):
+            release = find_release(repository, tag)
+            if release is not None:
+                break
+            if attempt + 1 < DRAFT_VISIBILITY_ATTEMPTS:
+                time.sleep(DRAFT_VISIBILITY_DELAY_SECONDS)
         if release is None:
             raise ValueError("created draft was not found in release list")
     if release["prerelease"]:

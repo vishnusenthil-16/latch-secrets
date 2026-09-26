@@ -11,18 +11,28 @@ import publish_release
 
 
 class FakeGitHub:
-    def __init__(self, assets=None, draft=True, later_page=False, duplicate=False):
+    def __init__(self, assets=None, draft=True, later_page=False, duplicate=False,
+                 visibility_misses=0, api_error_after_create=False):
         self.assets = assets
         self.draft = draft
         self.later_page = later_page
         self.duplicate = duplicate
+        self.visibility_misses = visibility_misses
+        self.api_error_after_create = api_error_after_create
+        self.created = False
         self.calls = []
 
     def __call__(self, *args, **_kwargs):
         self.calls.append(args)
         if args[0] == "api":
+            if self.created and self.api_error_after_create:
+                raise RuntimeError("GitHub API failed")
             pages = [[dict(tag_name="v0.0.9", draft=False, prerelease=False, assets=[])]]
-            if self.assets is not None:
+            visible = self.assets is not None
+            if self.created and self.visibility_misses:
+                self.visibility_misses -= 1
+                visible = False
+            if visible:
                 target = dict(tag_name="v0.1.0", draft=self.draft, prerelease=False,
                               assets=[dict(name=name) for name in self.assets])
                 if self.later_page:
@@ -34,6 +44,7 @@ class FakeGitHub:
             return subprocess.CompletedProcess(args, 0, json.dumps(pages), "")
         if args[:2] == ("release", "create"):
             self.assets = {}
+            self.created = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:2] == ("release", "upload"):
             for value in args[5:]:
@@ -75,6 +86,32 @@ class PublishReleaseTests(unittest.TestCase):
         self.assertFalse(fake.draft)
         self.assertEqual([x[:2] for x in fake.calls if x[0] == "release" and x[1] != "download"],
                          [("release", "create"), ("release", "upload"), ("release", "edit")])
+
+    def test_created_draft_appears_after_several_reads(self):
+        fake = FakeGitHub(visibility_misses=3)
+        with patch.object(publish_release.time, "sleep") as sleep:
+            self.publish(fake)
+        self.assertEqual(sleep.call_count, 3)
+        sleep.assert_any_call(publish_release.DRAFT_VISIBILITY_DELAY_SECONDS)
+        self.assertEqual(fake.assets, self.expected)
+        self.assertFalse(fake.draft)
+
+    def test_created_draft_visibility_timeout(self):
+        fake = FakeGitHub(visibility_misses=publish_release.DRAFT_VISIBILITY_ATTEMPTS)
+        with patch.object(publish_release.time, "sleep") as sleep:
+            with self.assertRaisesRegex(ValueError, "draft was not found"):
+                self.publish(fake)
+        self.assertEqual(sleep.call_count, publish_release.DRAFT_VISIBILITY_ATTEMPTS - 1)
+        self.assertFalse(any(call[:2] in (("release", "upload"), ("release", "edit"))
+                             for call in fake.calls))
+
+    def test_api_failure_after_create_is_not_retried(self):
+        fake = FakeGitHub(api_error_after_create=True)
+        with patch.object(publish_release.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "GitHub API failed"):
+                self.publish(fake)
+        sleep.assert_not_called()
+        self.assertEqual(len([call for call in fake.calls if call[0] == "api"]), 2)
 
     def test_existing_empty_and_partial_drafts_recover(self):
         for existing in ({}, {"latch-secrets-0.1.0.tar.gz": b"archive"}):
