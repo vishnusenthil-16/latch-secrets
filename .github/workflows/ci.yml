@@ -1,0 +1,29 @@
+name: check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Prepare and test local Homebrew snapshot
+        env:
+          HOMEBREW_DEVELOPER: '1'
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_ANALYTICS: '1'
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          python3 scripts/prepare_release.py --tag "v$VERSION" --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/latch-snapshot" --snapshot
+          brew ruby scripts/check_homebrew.rb "$RUNNER_TEMP/latch-snapshot"
