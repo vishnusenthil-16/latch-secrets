@@ -317,8 +317,8 @@ fn help_and_noninteractive_login() {
 }
 
 #[test]
-fn interactive_login_and_api_unlock_capture_session_without_echo() {
-    // pty.fork supplies a controlling terminal for rpassword; all credentials are synthetic.
+fn interactive_login_masks_password_and_echoes_email() {
+    // Exercise the actual terminal prompts; all credentials are synthetic.
     let fixture = Fixture::new();
     let driver = r#"
 import os, pty, select, sys, time, termios
@@ -333,6 +333,8 @@ else:
 output = b''
 index = 0
 status = None
+awaiting_mask = False
+mask_verified = False
 deadline = time.monotonic() + 10
 try:
     while time.monotonic() < deadline:
@@ -341,13 +343,22 @@ try:
             try: chunk = os.read(fd, 4096)
             except OSError: chunk = b''
             output += chunk
-            if index < len(steps) and steps[index][0] in output:
-                # A PTY driver can respond faster than rpassword changes terminal mode.
-                # Wait for non-echo input readiness before sending synthetic credentials.
-                while termios.tcgetattr(fd)[3] & termios.ECHO:
-                    assert time.monotonic() < deadline, 'terminal did not disable echo'
+            if awaiting_mask and b'***' in output:
+                mask_verified = True
+                awaiting_mask = False
+                os.write(fd, b'\r')
+            elif not awaiting_mask and index < len(steps) and steps[index][0] in output:
+                visible = steps[index][0] == b'Account email:'
+                while bool(termios.tcgetattr(fd)[3] & termios.ECHO) != visible:
+                    assert time.monotonic() < deadline, 'terminal echo mode not ready'
                     time.sleep(0.001)
-                os.write(fd, steps[index][1] + b'\n')
+                if index == 0:
+                    # Verify masking while typing, before the submitted-value summary.
+                    # Include a typo and backspace to check password editing too.
+                    os.write(fd, b'synthetic-masteX\x7fr')
+                    awaiting_mask = True
+                else:
+                    os.write(fd, steps[index][1] + b'\n')
                 index += 1
         done, result = os.waitpid(pid, os.WNOHANG)
         if done:
@@ -355,6 +366,9 @@ try:
             break
     assert status == 0, 'login did not complete successfully'
     assert index == len(steps), 'expected authentication prompts'
+    assert mask_verified, 'password was not visibly masked while typing'
+    if '--api-key' not in sys.argv:
+        assert b'Account email: test@example.test' in output, 'email was hidden'
     assert b'"session_stored":true' in output, 'missing success result'
     for secret in [b'synthetic-master', b'synthetic-client-secret', b'SYNTHETIC_SESSION']:
         assert secret not in output, 'secret echoed'

@@ -1,4 +1,5 @@
 mod bw;
+mod capabilities;
 mod config;
 mod session;
 mod vault;
@@ -7,7 +8,12 @@ mod write;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use std::{ffi::OsString, io::IsTerminal, path::PathBuf, process::Command};
+use std::{
+    ffi::OsString,
+    io::{IsTerminal, Write},
+    path::PathBuf,
+    process::Command,
+};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -29,6 +35,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Describe the agent interface without configuration or authentication.
+    Capabilities,
     /// Configure an isolated vault and install the macOS desktop session helper.
     Configure {
         #[arg(long)]
@@ -104,6 +112,10 @@ fn output(value: Value, json_output: bool) {
 }
 
 fn execute(cli: &Cli) -> Result<()> {
+    if matches!(cli.command, Action::Capabilities) {
+        output(capabilities::manifest(), cli.json);
+        return Ok(());
+    }
     let state = config::State::new(cli.state_dir.clone())?;
     if matches!(cli.command, Action::SessionServe) {
         return session::serve(&state.root);
@@ -213,7 +225,12 @@ fn execute(cli: &Cli) -> Result<()> {
                 "session helper unavailable; run configure from a logged-in desktop session",
             )?;
             let status = initial_status;
-            let password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
+            let password = Zeroizing::new(
+                inquire::Password::new("Master password:")
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .without_confirmation()
+                    .prompt()?,
+            );
             let result = if status["status"] == "unauthenticated" {
                 if *api_key {
                     let id =
@@ -223,8 +240,11 @@ fn execute(cli: &Cli) -> Result<()> {
                     backend.authenticate_api(&id, &secret)?;
                     backend.unlock(&password)?
                 } else {
-                    let email = Zeroizing::new(rpassword::prompt_password("Account email: ")?);
-                    backend.login(&email, &password)?
+                    eprint!("Account email: ");
+                    std::io::stderr().flush()?;
+                    let mut email = Zeroizing::new(String::new());
+                    std::io::stdin().read_line(&mut email)?;
+                    backend.login(email.trim_end_matches(['\r', '\n']), &password)?
                 }
             } else {
                 backend.unlock(&password)?
