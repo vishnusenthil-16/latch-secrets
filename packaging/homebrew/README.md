@@ -1,6 +1,6 @@
 # macOS Homebrew releases
 
-This pipeline prepares source releases and proposes updates to an independently maintained Homebrew tap. It does not build bottles, publish automatically, merge tap PRs, install Bitwarden, or activate Latch's session helper.
+This pipeline publishes stable source releases and updates the Homebrew tap when a new stable tag is pushed. It does not build bottles, install Bitwarden, or activate Latch's session helper.
 
 ## Local preparation and validation
 
@@ -28,41 +28,31 @@ Outputs:
 
 Normal preparation omits `--snapshot`. It requires a clean worktree, including untracked files, and HEAD at the existing `vX.Y.Z` tag matching `Cargo.toml`. It packages only allowlisted Git-tracked source inputs; ignored files and build artifacts are excluded. Choose an ignored output directory such as `target/` or a directory outside the worktree.
 
-## Source release workflow
+## One-time GitHub setup
 
-`.github/workflows/release.yml` is manually dispatched, with two inputs:
+The source repository needs GitHub Actions enabled and a `release` environment. The publish job uses only the source repository's `GITHUB_TOKEN` with `contents: write`; packaging and CI keep `contents: read`. Leave the `release` environment without required reviewers or restrictive tag rules for unattended publication. An approval rule will pause the run until a reviewer acts.
 
-- `tag`: an existing stable tag, for example `v0.1.0`.
-- `create_draft`: false by default. False produces only a downloadable Actions artifact. True creates a **draft** GitHub release after code tests, packaging tests, bundle verification, and the isolated Homebrew check pass.
+The public `vishnusenthil-16/homebrew-tap` repository needs an initialized default branch and `packaging/homebrew/tap-ci.yml` installed there as `.github/workflows/check.yml`. Tap CI installs the formula from source, runs `brew audit --strict`, and tests the executable without vault credentials. The default branch must allow the token owner to push formula updates; a branch protection rule that blocks direct pushes will make the tap job fail.
 
-The pipeline does not create or push tags. Commit/review the changes and create/push the release tag only when those actions are authorized. Run the workflow from the default branch after the pipeline is present there. Normal release inputs and the formula template come from the selected tag. The upload step rebuilds the expected source bundle from the tag, compares the decompressed archive and complete formula, and rechecks the tag commit against the artifact, and refuses to overwrite an existing release (`gh release create` fails if one already exists).
+Create a fine-grained personal access token for the tap repository only, with **Contents: Read and write** and the automatic **Metadata: Read** permission. It needs no Pull requests or Workflows permission. Store it as the `TAP_GITHUB_TOKEN` **environment secret** in the source repository's `homebrew` environment. The token owner must have write access to the tap. Leave that environment without required reviewers or restrictive tag rules for unattended updates. The source repository's `GITHUB_TOKEN` cannot write to the separate tap.
 
-Configure the GitHub `release` environment with required reviewers if publication-related actions need an enforced approval gate. Merely naming an environment in YAML does not configure reviewers. The draft job has a narrowly scoped `contents: write` token; ordinary CI and preparation have `contents: read`.
+## Releasing a version
 
-Review the draft and complete the live macOS acceptance checks before explicitly publishing it. Draft release URLs cannot be used by ordinary Homebrew users. Once public, treat the tag and release assets as immutable; make a new version for changes rather than replacing assets.
+1. Merge the release workflow, Homebrew workflow, and scripts to the source repository's default branch before creating the next tag. GitHub executes the workflow files from the tag commit.
+2. Change `Cargo.toml` to the intended stable `X.Y.Z` version. Run `cargo check` to refresh the package version in `Cargo.lock`; commit both files and all release inputs, then let CI pass. The tag must match this version exactly and point at the commit to publish.
+3. Create and push the stable `vX.Y.Z` tag. That push runs `.github/workflows/release.yml` automatically. It tests Rust and Python, builds and verifies four deterministic assets, exercises the formula on macOS, publishes a stable GitHub release, then directly calls the reusable Homebrew workflow. The tap job validates the published assets against the same tag before pushing `Formula/latch-secrets.rb` to the tap's default branch.
 
-## Tap setup and update workflow
+The workflow never creates or moves a tag. It creates a draft release, uploads any missing assets, verifies all four, then publishes it. On retry, an existing draft or published release can be completed only if every existing expected asset is byte-identical to the newly verified bundle; differing, duplicate, or unexpected assets fail without replacement. Prereleases are refused. The tap update is also repeatable: identical formula bytes succeed, a different formula at the same version or an older version fails. Use a new version for changes. The manually bootstrapped `v0.1.0` tap formula has an audit-only edit relative to its immutable release asset, so retrying its tap step will deliberately report a same-version mismatch; the next version advances normally.
 
-The proposed tap is `vishnusenthil-16/homebrew-tap`. It must exist and have an initialized default branch before the update workflow is run. Creation and pushing are separate authorized actions; the pipeline does not create a remote repository.
+For recovery, manually dispatch `release.yml` with the existing tag to retry the entire sequence, or `homebrew.yml` with the tag and tap repository to retry just the tap stage after the stable release is public. These recovery paths apply to tags that contain this pipeline; `v0.1.0` predates the publishing scripts and was bootstrapped manually. Do not use a release event to chain these jobs: releases created with `GITHUB_TOKEN` do not start a new release-triggered workflow. The direct reusable-workflow call guarantees the tap stage runs after publication.
 
-Copy `packaging/homebrew/tap-ci.yml` into the tap as `.github/workflows/check.yml`. This workflow installs the checked-out formula from source using Homebrew's real Rust dependency, then runs `brew audit --strict` and `brew test`. No vault credentials are needed. Installation itself never invokes `configure` or starts a service.
-
-Configure a fine-grained `TAP_GITHUB_TOKEN` secret in the source repository's `homebrew` environment. Limit it to the tap repository, with Contents and Pull requests read/write. Configure required reviewers on that environment if desired. The source repository's ordinary `GITHUB_TOKEN` cannot generally push to a separate tap repository.
-
-After a release is public, manually dispatch `.github/workflows/homebrew.yml` with its tag and the tap repository. It:
-
-1. Rejects draft/prerelease sources and invalid inputs.
-2. Downloads the release assets; checks metadata, checksums, formula URL, and the current tag commit, then compares the source archive and complete formula against a bundle rebuilt from that tag.
-3. Creates a `latch-release/vX.Y.Z` branch containing only `Formula/latch-secrets.rb`.
-4. Opens a PR for review. It never force-pushes or merges. A rerun recognizes an identical existing branch/PR only when its entire PR diff changes the formula alone; conflicting or unrelated changes fail for review.
-
-Merge that PR only after tap checks pass and merging is authorized. Once merged, users can install with:
+Once the tap update succeeds, users can install with:
 
 ```sh
 brew install vishnusenthil-16/tap/latch-secrets
 ```
 
-This command is the intended published interface, not a claim that the tap or formula is already online.
+The release and tap must both be public for Homebrew to fetch the source archive.
 
 ## Runtime dependency and upgrades
 
@@ -78,4 +68,4 @@ For a planned upgrade where the old helper cannot remain running, run `latch loc
 
 If an earlier development build left an item that its replacement cannot read, use Keychain Access to remove only the Latch session item for that state directory, restart its existing LaunchAgent with the new executable, then configure and log in again. The service is `com.latch-secrets.session`; the account is `uid:<uid>:<hex-encoded absolute state path>`. Do not delete the login Keychain or other applications’ items. Older unreleased broker protocols may also require this recovery; automatic migration from development snapshots is not guaranteed.
 
-macOS is the only supported release platform. Native source builds avoid a separate ARM/Intel binary matrix; each architecture still needs runtime validation before claiming support. Bottles, signing/notarization, and automatic tap merging are outside this first pipeline.
+macOS is the only supported release platform. Native source builds avoid a separate ARM/Intel binary matrix; each architecture still needs runtime validation before claiming support. Bottles and signing/notarization are outside this first pipeline.
