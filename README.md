@@ -47,7 +47,13 @@ The Cargo package is `latch-secrets`; the installed executable is `latch`.
 
 ### Homebrew
 
-Homebrew packaging is prepared, but the tap has not been published. Use the source installation above for now. Maintainers can follow the [Homebrew release guide](packaging/homebrew/README.md) to validate and publish a release.
+Install from the public tap on macOS:
+
+```sh
+brew install vishnusenthil-16/tap/latch-secrets
+```
+
+Install the supported `bw` version separately before configuring Latch. Maintainers can follow the [Homebrew release guide](packaging/homebrew/README.md) for automated stable releases.
 
 ## Quickstart
 
@@ -227,7 +233,7 @@ Automated tests cover metadata filtering, field selection, subprocess behavior, 
 
 Local acceptance used synthetic credentials, the real pinned Bitwarden CLI, and a disposable Vaultwarden 1.37.2 instance. It covered login, sync, metadata-only discovery, subprocess and file injection, fresh SSH connections, helper restart, lock, and relogin. An isolated Keychain test verified prompt-free failure while locked and recovery after unlocking. A Homebrew-style binary-swap test replaced a running helper’s executable and recovered its session through `configure`.
 
-The local test server used a test-only TLS wrapper; production TLS settings were unchanged. Intel Macs and hosted release/tap workflows have not been exercised. Local Homebrew checks compile the source archive and exercise the formula’s fetch, install, and test hooks; they do not substitute for the tap’s native dependency-installation CI. Test your deployment before replacing an existing credentials workflow.
+The local test server used a test-only TLS wrapper; production TLS settings were unchanged. Intel Macs and the new tag-triggered publishing workflow have not been exercised. Local Homebrew checks compile the source archive and exercise the formula’s fetch, install, and test hooks; they do not substitute for the tap’s native dependency-installation CI. Test your deployment before replacing an existing credentials workflow.
 
 Contributions should include focused verification for changed behavior. Keep account details, credentials, sessions, and private infrastructure configuration out of code, fixtures, issues, and pull requests. No minimum Rust version older than the current stable toolchain is promised yet.
 
