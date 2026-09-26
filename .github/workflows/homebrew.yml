@@ -1,0 +1,99 @@
+name: Propose Homebrew tap update
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag (vX.Y.Z)
+        required: true
+        type: string
+      tap_repository:
+        description: Existing tap repository (owner/homebrew-tap)
+        default: vishnusenthil-16/homebrew-tap
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-${{ inputs.tap_repository }}
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    environment: homebrew
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate inputs and require a published stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          TAP_REPOSITORY: ${{ inputs.tap_repository }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          assert re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', os.environ['RELEASE_TAG']), 'Invalid tag'
+          assert re.fullmatch(r'[A-Za-z0-9_.-]+/homebrew-[A-Za-z0-9_.-]+', os.environ['TAP_REPOSITORY']), 'Invalid tap repository'
+          PY
+          gh release view "$RELEASE_TAG" --repo "$SOURCE_REPOSITORY" --json isDraft,isPrerelease > release-state.json
+          python3 -c 'import json; x=json.load(open("release-state.json")); assert not x["isDraft"] and not x["isPrerelease"], "Release must be published and stable"'
+          gh release download "$RELEASE_TAG" --repo "$SOURCE_REPOSITORY" --dir bundle --pattern '*.tar.gz' --pattern latch-secrets.rb --pattern SHA256SUMS --pattern release.json
+          mkdir bundle/Formula
+          mv bundle/latch-secrets.rb bundle/Formula/latch-secrets.rb
+          python3 source/scripts/prepare_release.py --tag "$RELEASE_TAG" --repository "$SOURCE_REPOSITORY" --output "$RUNNER_TEMP/expected-release"
+          python3 source/scripts/verify_release.py --bundle bundle --tag "$RELEASE_TAG" --repository "$SOURCE_REPOSITORY" --expected "$RUNNER_TEMP/expected-release"
+          SOURCE_SHA=$(python3 -c 'import json; print(json.load(open("bundle/release.json"))["commit"])')
+          TAG_SHA=$(gh api "repos/$SOURCE_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          test "$SOURCE_SHA" = "$TAG_SHA"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.tap_repository }}
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          fetch-depth: 0
+          path: tap
+      - name: Open a reviewable formula update (never merge)
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          TAP_REPOSITORY: ${{ inputs.tap_repository }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        working-directory: tap
+        run: |
+          BRANCH="latch-release/$RELEASE_TAG"
+          BASE=$(git branch --show-current)
+          mkdir -p Formula
+          cp ../bundle/Formula/latch-secrets.rb Formula/latch-secrets.rb
+          git add -- Formula/latch-secrets.rb
+          if git diff --cached --quiet; then
+            echo 'Tap already contains this formula.'
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            CHANGED_PATHS=$(git diff --name-only "origin/$BASE...FETCH_HEAD")
+            test "$CHANGED_PATHS" = 'Formula/latch-secrets.rb'
+            git show FETCH_HEAD:Formula/latch-secrets.rb > ../existing-formula.rb
+            cmp ../existing-formula.rb Formula/latch-secrets.rb
+            EXISTING=$(gh pr list --repo "$TAP_REPOSITORY" --head "$BRANCH" --json url --jq '.[0].url // empty')
+            if [ -n "$EXISTING" ]; then
+              echo "$EXISTING"
+              exit 0
+            fi
+          else
+            git switch -c "$BRANCH"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Update latch-secrets to $RELEASE_TAG"
+            git push origin "$BRANCH"
+          fi
+          printf 'Update Latch to %s.\n\nSource release: https://github.com/%s/releases/tag/%s\n\nThe source and formula checksums were verified. Merge after tap checks pass.\n' "$RELEASE_TAG" "$SOURCE_REPOSITORY" "$RELEASE_TAG" > ../tap-pr-body.md
+          gh pr create --repo "$TAP_REPOSITORY" --base "$BASE" --head "$BRANCH" --title "latch-secrets $RELEASE_TAG" --body-file ../tap-pr-body.md

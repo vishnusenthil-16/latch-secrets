@@ -1,0 +1,95 @@
+name: Prepare macOS Homebrew release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag matching Cargo.toml (vX.Y.Z)
+        required: true
+        type: string
+      create_draft:
+        description: Create a draft GitHub release after checks pass
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate code and release tooling
+        run: |
+          cargo fmt --check
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Prepare immutable source bundle
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/prepare_release.py --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --output "$RUNNER_TEMP/latch-release"
+          python3 scripts/verify_release.py --bundle "$RUNNER_TEMP/latch-release" --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
+      - name: Exercise Homebrew formula in an isolated prefix
+        env:
+          HOMEBREW_DEVELOPER: '1'
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_ANALYTICS: '1'
+        run: brew ruby scripts/check_homebrew.rb "$RUNNER_TEMP/latch-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-release
+          path: ${{ runner.temp }}/latch-release/
+          if-no-files-found: error
+
+  draft:
+    if: ${{ inputs.create_draft }}
+    needs: package
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # Rebuild from the tag; never execute code from downloaded assets.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: homebrew-release
+          path: ${{ runner.temp }}/bundle
+      - name: Verify and upload a draft (never publish automatically)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/prepare_release.py --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --output "$RUNNER_TEMP/expected-release"
+          python3 scripts/verify_release.py --bundle "$RUNNER_TEMP/bundle" --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --expected "$RUNNER_TEMP/expected-release"
+          cd "$RUNNER_TEMP"
+          SOURCE_SHA=$(python3 -c 'import json; print(json.load(open("bundle/release.json"))["commit"])')
+          TAG_SHA=$(gh api "repos/$RELEASE_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          test "$SOURCE_SHA" = "$TAG_SHA"
+          gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --verify-tag --draft --title "Latch $RELEASE_TAG" --notes 'macOS source release with Homebrew formula. Review the validation artifacts and complete live acceptance before publishing.' bundle/*.tar.gz bundle/Formula/latch-secrets.rb bundle/SHA256SUMS bundle/release.json
