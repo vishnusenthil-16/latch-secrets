@@ -7,7 +7,12 @@ mod write;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use std::{ffi::OsString, io::IsTerminal, path::PathBuf, process::Command};
+use std::{
+    ffi::OsString,
+    io::{IsTerminal, Write},
+    path::PathBuf,
+    process::Command,
+};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -213,7 +218,12 @@ fn execute(cli: &Cli) -> Result<()> {
                 "session helper unavailable; run configure from a logged-in desktop session",
             )?;
             let status = initial_status;
-            let password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
+            let password = Zeroizing::new(
+                inquire::Password::new("Master password:")
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .without_confirmation()
+                    .prompt()?,
+            );
             let result = if status["status"] == "unauthenticated" {
                 if *api_key {
                     let id =
@@ -223,8 +233,11 @@ fn execute(cli: &Cli) -> Result<()> {
                     backend.authenticate_api(&id, &secret)?;
                     backend.unlock(&password)?
                 } else {
-                    let email = Zeroizing::new(rpassword::prompt_password("Account email: ")?);
-                    backend.login(&email, &password)?
+                    eprint!("Account email: ");
+                    std::io::stderr().flush()?;
+                    let mut email = Zeroizing::new(String::new());
+                    std::io::stdin().read_line(&mut email)?;
+                    backend.login(email.trim_end_matches(['\r', '\n']), &password)?
                 }
             } else {
                 backend.unlock(&password)?
