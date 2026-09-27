@@ -95,6 +95,7 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/homebrew.yml
+    secrets: inherit
     with:
       tag: ${{ inputs.tag || github.ref_name }}
       tap_repository: vishnusenthil-16/homebrew-tap
