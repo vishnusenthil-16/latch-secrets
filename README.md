@@ -12,6 +12,7 @@ Authentication, encryption, and vault synchronization are handled by Bitwarden. 
 
 ## Features
 
+- **Secret creation and rotation.** Create personal login items and patch existing login credentials through stdin without printing values.
 - **Metadata-only discovery.** Find items by name without displaying their credentials.
 - **Subprocess injection.** Pass selected fields as environment variables without printing them.
 - **File injection.** Update a `.env` file or managed exports in `.zshrc`.
@@ -108,6 +109,36 @@ Latch executes the command directly, without an implicit shell. It inherits ordi
 
 `list`, `run`, and `write` read the last synchronized local vault. Run `latch sync` when you need current server data; synchronization and retries are explicit.
 
+### Create or update secrets
+
+`latch create` creates a personal login item. `latch update ITEM_UUID` patches an existing login item, including rotating its stored password or custom fields. Both accept strict JSON through piped or redirected stdin (maximum 1 MiB), never secret command-line arguments. Have your credential-producing process serialize JSON directly into the pipe; do not paste real secrets into shell history.
+
+Input shape (placeholder values only):
+
+```json
+{"name":"service","login":{"username":"USER","password":"SECRET"},"fields":[{"name":"token","value":"SECRET","type":"hidden"}]}
+```
+
+`name` is required for creation and optional for updates. Updates preserve all unspecified properties, including other custom fields, notes, URIs, and organization metadata. Fields are matched by exact name; new fields default to `hidden`, while existing field types are preserved unless `type` is provided (`text` or `hidden`). Empty string values are allowed. Nulls, unknown/duplicate keys, duplicate field names, empty patches, NUL characters, unsupported item/field types, and ambiguous targeted fields are rejected. Field deletion and organization-targeted creation are not supported.
+
+```sh
+# These programs represent your own trusted JSON-producing processes.
+credential-producer | latch create --json
+rotation-producer | latch update ITEM_UUID --json
+```
+
+Success returns only `{id,created,updated}`. Both commands synchronize first; updates fetch the current item before patching. Local Latch operations are serialized, but edits by other clients are not atomic with this fetch/edit sequence: avoid concurrent external edits. Mutations are never automatically retried. If the outcome is reported uncertain, inspect the vault before retrying, especially creation, which may otherwise produce duplicates.
+
+**Rotation changes the value stored in the vault only.** It does not generate, revoke, or rotate credentials at an external provider. Existing injected processes and written files retain old values; reinject or rewrite them as needed.
+
+### Delete a vault item
+
+```sh
+latch delete ITEM_UUID --json
+```
+
+Deletion moves the exact item to vault trash; Latch exposes no permanent-delete flag. It synchronizes and checks the target before deleting, rejects already-deleted items, and never automatically retries. Success returns `{id,deleted:true,permanent:false}`. On an uncertain outcome, inspect the vault before taking further action. Restore or manage retention through your vault client. Deletion does not revoke credentials at their provider or erase values already injected into processes or written to files.
+
 ### Write credentials to a file
 
 **File injection persists plaintext secrets.**
@@ -158,6 +189,9 @@ Use `--json` for machine-readable results. Never retrieve credentials into a con
 | `login` | Authenticate or unlock interactively and store the session in Keychain |
 | `status` | Report configuration, session accessibility, vault state, and last sync |
 | `sync` | Refresh the local encrypted vault from the server |
+| `create` | Create a personal login item from strict JSON stdin |
+| `update ITEM_UUID` | Patch a login item from strict JSON stdin; rotate stored values |
+| `delete ITEM_UUID` | Move an exact vault item to trash; never permanently delete |
 | `list` | Return item metadata; optionally filter names with `--search` |
 | `run` | Inject selected fields into a child process |
 | `write` | Persist selected fields into `.env` or `.zshrc` |
@@ -228,6 +262,19 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Automated tests cover metadata filtering, field selection, subprocess behavior, file formats and permissions, concurrency, session transport, and dependency compatibility. They use synthetic credentials, a fake Bitwarden process, and an in-memory session store.
+
+### Mutation acceptance test
+
+Focused mutation coverage is included in `cargo test --locked --all-targets`: stdin validation and transport, metadata-only output, preservation, no-retry failures, and create → inject → rotate → inject flows against a synthetic backend.
+
+For opt-in live acceptance against an already configured and unlocked vault:
+
+```sh
+cargo build --locked
+python3 scripts/test_mutations_live.py --latch target/debug/latch --confirm-create-test-item
+```
+
+This creates one uniquely named synthetic item, verifies values without printing them, rotates its password, synchronizes and verifies preservation. It soft-deletes the known test UUID in a `finally` cleanup path, then verifies discovery excludes it and injection is refused. It never modifies pre-existing items. Cleanup is attempted once; failures print the UUID for manual inspection. An uncertain creation response may not supply a UUID, so inspect the vault before rerunning. Deleted test items remain in vault trash subject to server retention.
 
 ### Validation
 
