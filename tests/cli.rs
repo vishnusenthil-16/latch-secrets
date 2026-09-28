@@ -63,6 +63,28 @@ if args[0] == 'lock':
     (root/'locked').touch(); sys.exit(0)
 assert os.environ.get('BW_SESSION') == 'SYNTHETIC_SESSION'
 item = {'id':'00000000-0000-4000-8000-000000000001','name':'test-service','type':1,'organizationId':None,'collectionIds':[], 'notes':'CANARY_NOTES','login':{'username':'user','password':"CANARY_latch_$(not executed)'\"\\end"}, 'fields':[{'name':'token','type':1,'value':'CANARY_CUSTOM'}]}
+if (root/'item.json').exists(): item = json.loads((root/'item.json').read_text())
+if args[0] in ('create', 'edit'):
+    import base64
+    assert args == (['create', 'item', '--nointeraction'] if args[0] == 'create' else ['edit', 'item', item['id'], '--nointeraction'])
+    payload = json.loads(base64.b64decode(sys.stdin.read()))
+    if (root/'mutation-fail').exists():
+        print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
+    payload['id'] = '00000000-0000-4000-8000-000000000001'
+    (root/'item.json').write_text(json.dumps(payload))
+    if (root/'bad-response').exists(): print('CANARY_invalid_response')
+    else: print(json.dumps(payload))
+    sys.exit(0)
+if args[0] == 'delete':
+    assert args == ['delete', 'item', item['id'], '--nointeraction']
+    assert item.get('deletedDate') is None
+    if (root/'mutation-fail').exists():
+        print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
+    item['deletedDate'] = '2026-09-28T00:00:00Z'
+    (root/'item.json').write_text(json.dumps(item))
+    print('CANARY_ignored_success_output'); sys.exit(0)
+if args[0] == 'get' and (root/'missing-item').exists():
+    print('CANARY_missing', file=sys.stderr); sys.exit(1)
 if args[0] == 'list': print(json.dumps([item]))
 elif args[0] == 'get': print(json.dumps(item))
 elif args[0] == 'sync': pass
@@ -146,6 +168,23 @@ else: sys.exit(7)
     }
     fn call(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
+    }
+    fn input(&self, args: &[&str], input: &str) -> Output {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
@@ -438,6 +477,7 @@ fn wrong_or_reset_endpoint_blocks_authentication_and_secret_operations() {
             vec!["login"],
             vec!["login", "--api-key"],
             vec!["sync"],
+            vec!["delete", ID],
             vec!["list"],
             vec![
                 "run",
@@ -503,6 +543,329 @@ fn configure_preserves_existing_state_when_old_helper_is_unavailable() {
         assert_eq!(
             fs::read_to_string(fixture.path("calls")).unwrap(),
             "--version\n"
+        );
+        public(&out);
+    }
+}
+
+#[test]
+fn create_inject_rotate_inject_preserves_metadata_and_hides_payloads() {
+    let f = Fixture::new();
+    let out = f.input(&["create"], &json!({"name":"service","login":{"username":"CANARY_USER","password":"CANARY_FIRST"},"fields":[{"name":"token","value":"CANARY_TOKEN"}]}).to_string());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    public(&out);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result, json!({"id":ID,"created":true,"updated":false}));
+    let readback = |expected: &str| {
+        let out = f.call(&["run","--env",&format!("TOKEN={ID}/login.password"),"--env",&format!("CUSTOM={ID}/custom.token"),"--","/usr/bin/python3","-c",&format!("import os; assert os.environ['TOKEN'] == {expected:?}; assert os.environ['CUSTOM'] == 'CANARY_TOKEN'")]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        public(&out);
+    };
+    readback("CANARY_FIRST");
+    let mut before: Value =
+        serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    before["notes"] = json!("CANARY_NOTES");
+    before["login"]["totp"] = json!("CANARY_TOTP");
+    before["organizationId"] = json!("organization");
+    before["collectionIds"] = json!(["collection"]);
+    before["attachments"] = json!([{"id":"attachment"}]);
+    before["revisionDate"] = json!("revision");
+    fs::write(f.path("item.json"), before.to_string()).unwrap();
+    let out = f.input(&["update", ID], r#"{"login":{"password":"CANARY_SECOND"}}"#);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    public(&out);
+    readback("CANARY_SECOND");
+    before["login"]["password"] = json!("CANARY_SECOND");
+    let after: Value = serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    assert_eq!(after, before);
+    let calls = fs::read_to_string(f.path("calls")).unwrap();
+    assert!(calls.contains("sync\ncreate\n"));
+    assert!(calls.contains("sync\nget\nedit\n"));
+    assert_eq!(calls.lines().filter(|s| *s == "create").count(), 1);
+    assert_eq!(calls.lines().filter(|s| *s == "edit").count(), 1);
+}
+
+#[test]
+fn mutation_input_and_backend_failures_are_safe_and_never_retried() {
+    let f = Fixture::new();
+    for input in [
+        r#"{"name":"CANARY","login":{"password":null}}"#,
+        r#"{"name":"CANARY","unknown":"CANARY"}"#,
+        r#"{"name":"CANARY","name":"CANARY"}"#,
+        "CANARY",
+    ] {
+        let out = f.input(&["create"], input);
+        assert!(!out.status.success());
+        public(&out);
+    }
+    let out = f.input(
+        &["update", "CANARY_NOT_UUID"],
+        r#"{"login":{"password":"CANARY"}}"#,
+    );
+    assert!(!out.status.success());
+    public(&out);
+    let calls = fs::read_to_string(f.path("calls")).unwrap();
+    assert!(
+        !calls
+            .lines()
+            .any(|s| matches!(s, "sync" | "create" | "edit"))
+    );
+    fs::write(f.path("mutation-fail"), "").unwrap();
+    let out = f.input(
+        &["create"],
+        r#"{"name":"service","login":{"password":"CANARY"}}"#,
+    );
+    assert!(!out.status.success());
+    public(&out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("outcome uncertain"));
+    assert!(!f.path("item.json").exists());
+    let calls = fs::read_to_string(f.path("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|s| *s == "create").count(), 1);
+    fs::remove_file(f.path("mutation-fail")).unwrap();
+    fs::write(f.path("bad-response"), "").unwrap();
+    let out = f.input(
+        &["create"],
+        r#"{"name":"service","login":{"password":"CANARY"}}"#,
+    );
+    assert!(!out.status.success());
+    public(&out);
+    assert!(f.path("item.json").exists());
+    let calls = fs::read_to_string(f.path("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|s| *s == "create").count(), 2);
+}
+
+#[test]
+fn update_rejects_unsupported_items_and_ambiguous_fields_without_edit() {
+    let f = Fixture::new();
+    for item in [
+        json!({"id":ID,"type":2}),
+        json!({"id":ID,"type":1,"fields":[{"name":"t","type":0},{"name":"t","type":1}]}),
+        json!({"id":ID,"type":1,"fields":[{"name":"t","type":3}]}),
+        json!({"id":ID,"type":1,"deletedDate":"date"}),
+        json!({"id":ID,"type":1,"archivedDate":"date"}),
+        json!({"id":"different","type":1}),
+    ] {
+        fs::write(f.path("item.json"), item.to_string()).unwrap();
+        let out = f.input(
+            &["update", ID],
+            r#"{"fields":[{"name":"t","value":"CANARY"}]}"#,
+        );
+        assert!(!out.status.success());
+        public(&out);
+        assert_eq!(
+            fs::read_to_string(f.path("item.json")).unwrap(),
+            item.to_string()
+        );
+    }
+    assert!(
+        !fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .lines()
+            .any(|s| s == "edit")
+    );
+}
+
+#[test]
+fn custom_field_rotation_preserves_types_and_creates_hidden_by_default() {
+    let f = Fixture::new();
+    let out = f.input(&["create"], r#"{"name":"service","fields":[{"name":"text","type":"text","value":"CANARY_OLD"},{"name":"hidden","value":"CANARY_OLD"}]}"#);
+    assert!(out.status.success());
+    public(&out);
+    let out = f.input(&["update", ID], r#"{"fields":[{"name":"text","value":"CANARY_NEW"},{"name":"hidden","type":"text","value":"CANARY_NEW"},{"name":"new","value":"CANARY_NEW"}]}"#);
+    assert!(out.status.success());
+    public(&out);
+    let item: Value = serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    assert_eq!(
+        item["fields"],
+        json!([{"name":"text","type":0,"value":"CANARY_NEW"},{"name":"hidden","type":0,"value":"CANARY_NEW"},{"name":"new","type":1,"value":"CANARY_NEW"}])
+    );
+    let out = f.call(&[
+        "run",
+        "--env",
+        &format!("TOKEN={ID}/custom.new"),
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        "import os; assert os.environ['TOKEN'] == 'CANARY_NEW'",
+    ]);
+    assert!(out.status.success());
+    public(&out);
+}
+
+#[test]
+fn delete_is_soft_only_and_repeat_and_injection_are_refused() {
+    let f = Fixture::new();
+    let out = f.call(&["delete", ID]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    public(&out);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"id":ID,"deleted":true,"permanent":false})
+    );
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\ndelete\n"
+    );
+    let out = f.call(&["delete", ID]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already deleted"));
+    public(&out);
+    let marker = f.path("child-started");
+    let dest = f.path("output.env");
+    fs::write(&dest, "UNCHANGED=yes\n").unwrap();
+    for args in [
+        vec![
+            "run",
+            "--env",
+            &format!("TOKEN={ID}/login.password"),
+            "--",
+            "/usr/bin/touch",
+            marker.to_str().unwrap(),
+        ],
+        vec![
+            "write",
+            "--env",
+            &format!("TOKEN={ID}/custom.token"),
+            "--dotenv",
+            dest.to_str().unwrap(),
+        ],
+    ] {
+        let out = f.call(&args);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("deleted items cannot be injected"));
+        public(&out);
+    }
+    assert!(!marker.exists());
+    assert_eq!(fs::read_to_string(dest).unwrap(), "UNCHANGED=yes\n");
+    assert_eq!(
+        fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .lines()
+            .filter(|c| *c == "delete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.call(&["delete", ID, "--permanent"]).status.code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn delete_rejects_invalid_missing_wrong_and_deleted_targets() {
+    let f = Fixture::new();
+    let out = f.call(&["delete", "CANARY_INVALID"]);
+    assert!(!out.status.success());
+    public(&out);
+    assert!(
+        !fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .contains("sync")
+    );
+    for item in [
+        json!(null),
+        json!({"id":"CANARY_WRONG"}),
+        json!({"id":ID,"deletedDate":"CANARY_DATE"}),
+    ] {
+        fs::write(f.path("item.json"), item.to_string()).unwrap();
+        let out = f.call(&["delete", ID]);
+        assert!(!out.status.success());
+        public(&out);
+    }
+    fs::write(f.path("missing-item"), "").unwrap();
+    let out = f.call(&["delete", ID]);
+    assert!(!out.status.success());
+    public(&out);
+    assert!(
+        !fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .lines()
+            .any(|c| c == "delete")
+    );
+}
+
+#[test]
+fn delete_failure_is_uncertain_sanitized_and_not_retried() {
+    let f = Fixture::new();
+    fs::write(f.path("mutation-fail"), "").unwrap();
+    let out = f.call(&["delete", ID]);
+    assert!(!out.status.success());
+    public(&out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("delete outcome uncertain"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not automatically retried"));
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\ndelete\n"
+    );
+    assert!(!f.path("item.json").exists());
+}
+
+#[test]
+fn delete_reuses_dependency_session_and_lock_guards() {
+    for failure in ["bad-version", "session", "lock"] {
+        let f = Fixture::new();
+        let held = fs::File::open(f.path("vault.lock")).unwrap();
+        match failure {
+            "bad-version" => fs::write(f.path("bad-version"), "").unwrap(),
+            "session" => assert!(f.call(&["lock"]).status.success()),
+            "lock" => fs2::FileExt::lock_exclusive(&held).unwrap(),
+            _ => unreachable!(),
+        }
+        let out = f.call(&["delete", ID]);
+        assert!(!out.status.success());
+        public(&out);
+        let calls = fs::read_to_string(f.path("calls")).unwrap_or_default();
+        assert!(
+            !calls
+                .lines()
+                .any(|c| matches!(c, "sync" | "get" | "delete"))
+        );
+    }
+}
+
+#[test]
+fn stalled_mutation_stdin_does_not_hold_vault_lock() {
+    for args in [vec!["create"], vec!["update", ID]] {
+        let f = Fixture::new();
+        let mut child = f
+            .command()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"login\":")
+            .unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let pending = child.try_wait().unwrap().is_none();
+        let out = f.call(&["status"]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(pending);
+        assert!(
+            out.status.success(),
+            "status must remain available while stdin is open"
         );
         public(&out);
     }

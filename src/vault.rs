@@ -105,6 +105,10 @@ pub(crate) fn resolve(
                 item["id"] == binding.id,
                 "bw returned a different item than requested"
             );
+            ensure!(
+                item["deletedDate"].is_null(),
+                "deleted items cannot be injected"
+            );
             cache.insert(binding.id.clone(), item);
         }
         let item = &cache[&binding.id];
