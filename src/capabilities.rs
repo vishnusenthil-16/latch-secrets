@@ -34,7 +34,7 @@ pub(crate) fn manifest() -> Value {
                 "arguments": arguments,
                 "help_command": ["latch", name, "--help"],
                 "requires_interactive_terminal": name == "login",
-                "requires_stored_session": matches!(name, "sync" | "list" | "run" | "write"),
+                "requires_stored_session": matches!(name, "sync" | "list" | "run" | "write" | "create" | "update" | "delete"),
             })
         })
         .collect();
@@ -66,6 +66,38 @@ pub(crate) fn manifest() -> Value {
             "reserved_environment_prefixes": ["BW_", "BITWARDENCLI_", "LATCH_"],
             "duplicate_environment_names_allowed": false,
             "discovery_command": ["latch", "list", "--search", "NAME", "--json"]
+        },
+        "mutations": {
+            "commands": {"create": ["latch", "create"], "update": ["latch", "update", "ITEM_UUID"]},
+            "input": "one strict UTF-8 JSON object on non-terminal stdin",
+            "max_input_bytes": crate::mutate::INPUT_LIMIT,
+            "schema": {
+                "name": "optional nonempty string; required for create",
+                "login": {"username": "optional string", "password": "optional string"},
+                "fields": [{"name": "unique nonempty exact name", "value": "string", "type": "optional: text or hidden"}]
+            },
+            "rules": ["unknown and duplicate JSON keys, nulls, NUL characters, empty patches and unsupported types are rejected", "login if present must contain username or password; fields if present must be nonempty", "new custom fields default to hidden; existing field types are preserved unless specified", "empty credential strings are allowed; field deletion is not supported", "create makes personal login items only; update accepts non-deleted, non-archived login items only", "update preserves unspecified fields and metadata; ambiguous or unsupported targeted custom fields are rejected"],
+            "backend_transport": "base64 JSON through stdin, never argv",
+            "implicit_sync": true,
+            "automatic_retry": false,
+            "concurrency": "exclusive local state lock and sync before fetch/edit; not an atomic cross-client compare-and-swap; avoid concurrent vault edits",
+            "failure": "a mutation error can have an uncertain outcome; inspect vault before retrying",
+            "rotation": "updates stored vault values only; does not issue or revoke provider credentials or refresh previously written files",
+            "success_fields": ["id", "created", "updated"],
+            "agent_instruction": "Never place secrets in argv, chat, shell history, tracing, or output. Feed stdin from a trusted secret source."
+        },
+        "deletion": {
+            "command": ["latch", "delete", "ITEM_UUID"],
+            "item_identifier": "uuid",
+            "input": "UUID argument only; no stdin payload",
+            "semantics": "soft delete to vault trash only; already-deleted items are refused",
+            "permanent_deletion_supported": false,
+            "implicit_sync": true,
+            "automatic_retry": false,
+            "concurrency": "exclusive local state lock; sync and exact-target validation before delete; not atomic across clients",
+            "failure": "backend delete failures have uncertain outcome; inspect vault before retrying",
+            "success": {"id": "ITEM_UUID", "deleted": true, "permanent": false},
+            "credential_effect": "deleted items cannot be injected by run/write; previously written files and provider credentials remain unchanged"
         },
         "credential_delivery": {
             "run": {

@@ -44,6 +44,9 @@ fn discovery_needs_no_home_backend_or_state_and_is_read_only() {
             "status",
             "sync",
             "list",
+            "create",
+            "update",
+            "delete",
             "run",
             "write",
             "lock",
@@ -65,5 +68,30 @@ fn discovery_needs_no_home_backend_or_state_and_is_read_only() {
     assert_eq!(
         manifest["output"]["operational_error_with_json"]["error"]["code"],
         "LATCH_ERROR"
+    );
+}
+
+#[test]
+fn delete_contract_is_soft_only() {
+    let output = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .args(["capabilities", "--json"])
+        .output()
+        .unwrap();
+    let m: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(m["deletion"]["permanent_deletion_supported"], false);
+    assert_eq!(m["deletion"]["automatic_retry"], false);
+    let command = m["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "delete")
+        .unwrap();
+    assert_eq!(command["requires_stored_session"], true);
+    assert!(
+        command["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["long"] != "permanent")
     );
 }

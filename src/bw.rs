@@ -2,7 +2,7 @@ use crate::config::{Config, State};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
-    io::Read,
+    io::{Read, Write},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -44,6 +44,22 @@ impl<'a> Bw<'a> {
             command.env("BW_SESSION", token);
         }
         captured(command)
+    }
+    pub fn mutate(&self, args: &[&str], token: &str, input: Zeroizing<String>) -> Result<String> {
+        let mut command = self.command();
+        command
+            .args(args)
+            .arg("--nointeraction")
+            .env("BW_SESSION", token);
+        captured_input(command, Duration::from_secs(90), 16 * 1024 * 1024, Some(input))
+            .map_err(|_| anyhow::anyhow!("mutation outcome uncertain: backend failed; inspect vault before retrying (not automatically retried)"))
+    }
+    pub fn soft_delete(&self, id: &str, token: &str) -> Result<()> {
+        // Pinned cli-v2026.8.0 apps/cli/src/vault/delete.command.ts selects
+        // softDeleteWithServer unless --permanent is supplied. Never expose it.
+        let _response = Zeroizing::new(self.call(&["delete", "item", id], Some(token))
+            .map_err(|_| anyhow::anyhow!("delete outcome uncertain: backend failed; inspect vault before retrying (not automatically retried)"))?);
+        Ok(())
     }
     pub fn configure_server(&self, saved_server_changed: bool) -> Result<()> {
         let status = self.raw_status(None)?;
@@ -146,16 +162,39 @@ fn captured(command: Command) -> Result<String> {
     captured_with_limits(command, Duration::from_secs(90), 16 * 1024 * 1024)
 }
 
-fn captured_with_limits(mut command: Command, timeout: Duration, limit: usize) -> Result<String> {
+fn captured_with_limits(command: Command, timeout: Duration, limit: usize) -> Result<String> {
+    captured_input(command, timeout, limit, None)
+}
+fn captured_input(
+    mut command: Command,
+    timeout: Duration,
+    limit: usize,
+    input: Option<Zeroizing<String>>,
+) -> Result<String> {
     // A separate process group lets timeout cleanup include bw runtime children.
     // Upstream stderr can contain credentials and is never forwarded.
     let mut child = command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .context("cannot start configured bw executable")?;
+    // Concurrent writing keeps a non-reading backend inside the process deadline.
+    let (input_sender, input_receiver) = mpsc::channel();
+    let mut input_done = input.is_none();
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        std::thread::spawn(move || {
+            let result = stdin.write_all(input.as_bytes());
+            drop(stdin);
+            let _ = input_sender.send(result);
+        });
+    }
     let stdout = child.stdout.take().expect("stdout is piped");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -171,6 +210,16 @@ fn captured_with_limits(mut command: Command, timeout: Duration, limit: usize) -
     let mut bytes = None;
     let result = (|| -> Result<String> {
         loop {
+            if !input_done {
+                match input_receiver.try_recv() {
+                    Ok(result) => {
+                        result.context("cannot write bw input")?;
+                        input_done = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => (),
+                    Err(mpsc::TryRecvError::Disconnected) => bail!("cannot write bw input"),
+                }
+            }
             if bytes.is_none() {
                 match receiver.try_recv() {
                     Ok(result) => {
@@ -193,7 +242,7 @@ fn captured_with_limits(mut command: Command, timeout: Duration, limit: usize) -
                     status.success(),
                     "bw operation failed; check login, connectivity, and compatibility with latch doctor"
                 );
-                if let Some(bytes) = bytes.take() {
+                if input_done && let Some(bytes) = bytes.take() {
                     return String::from_utf8(bytes)
                         .map_err(|_| anyhow::anyhow!("bw returned non-UTF-8 output"));
                 }
@@ -301,6 +350,28 @@ else: sys.exit(1)
             captured_with_limits(shell("sleep 10 & exit 0"), Duration::from_millis(150), 1024);
         assert!(result.unwrap_err().to_string().contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    fn stdin_delivery_is_bounded_and_errors_are_sanitized() {
+        let start = Instant::now();
+        let error = captured_input(
+            shell("sleep 10"),
+            Duration::from_millis(150),
+            1024,
+            Some(Zeroizing::new("CANARY".repeat(100_000))),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(!error.to_string().contains("CANARY"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let output = captured_input(
+            shell("cat"),
+            Duration::from_secs(2),
+            1024,
+            Some(Zeroizing::new("synthetic".into())),
+        )
+        .unwrap();
+        assert_eq!(output, "synthetic");
     }
     #[test]
     fn backend_failures_do_not_include_output() {

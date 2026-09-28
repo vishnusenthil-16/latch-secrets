@@ -1,6 +1,7 @@
 mod bw;
 mod capabilities;
 mod config;
+mod mutate;
 mod session;
 mod vault;
 mod write;
@@ -60,6 +61,12 @@ enum Action {
         #[arg(long)]
         search: Option<String>,
     },
+    /// Create a personal login item from strict JSON stdin; never pass secrets as arguments.
+    Create,
+    /// Update a login item by UUID from strict JSON stdin (stored-value rotation only).
+    Update { item_uuid: String },
+    /// Move an item by UUID to vault trash; permanent deletion is never supported.
+    Delete { item_uuid: String },
     /// Inject selected fields into a child; no implicit shell or synchronization.
     Run {
         #[arg(long = "env", required = true)]
@@ -168,6 +175,14 @@ fn execute(cli: &Cli) -> Result<()> {
         output(json!({"configured":false,"ready":false}), cli.json);
         return Ok(());
     }
+    // A producer may stall or itself need Latch; never hold the vault lock
+    // while waiting for its stdin. Validate the complete input first.
+    let mutation_input = match cli.command {
+        Action::Create | Action::Update { .. } => {
+            Some(mutate::read_stdin(matches!(cli.command, Action::Create))?)
+        }
+        _ => None,
+    };
     state.validate()?;
     let _guard = state.lock(false)?;
     let config = state.load()?;
@@ -275,6 +290,19 @@ fn execute(cli: &Cli) -> Result<()> {
             let items: Value = serde_json::from_str(&raw)
                 .map_err(|_| anyhow::anyhow!("bw returned invalid item data"))?;
             output(vault::metadata(&items, search.as_deref())?, cli.json);
+        }
+        Action::Create | Action::Update { .. } => {
+            let input = mutation_input.expect("mutation input was parsed before locking");
+            let token = Zeroizing::new(session::get(&state.root)?);
+            let id = match &cli.command {
+                Action::Update { item_uuid } => Some(item_uuid.as_str()),
+                _ => None,
+            };
+            output(mutate::execute(&backend, &token, id, input)?, cli.json);
+        }
+        Action::Delete { item_uuid } => {
+            let token = Zeroizing::new(session::get(&state.root)?);
+            output(mutate::delete(&backend, &token, item_uuid)?, cli.json);
         }
         Action::Run { bindings, .. } | Action::Write { bindings, .. } => {
             let selections = vault::parse_bindings(bindings)?;
