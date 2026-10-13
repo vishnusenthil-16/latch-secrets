@@ -870,3 +870,68 @@ fn stalled_mutation_stdin_does_not_hold_vault_lock() {
         public(&out);
     }
 }
+
+#[test]
+fn ssh_key_read_preserves_multiline_values_and_metadata_privacy() {
+    let f = Fixture::new();
+    let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nCANARY_SYNTHETIC_KEY\n-----END OPENSSH PRIVATE KEY-----\n";
+    fs::write(f.path("item.json"), json!({"id":ID,"name":"ssh-test","type":5,
+        "sshKey":{"privateKey":key,"publicKey":"CANARY_PUBLIC","keyFingerprint":"CANARY_FINGERPRINT"}
+    }).to_string()).unwrap();
+    let listed = f.call(&["list"]);
+    assert!(listed.status.success());
+    public(&listed);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap()[0]["type"],
+        5
+    );
+    let mappings = [
+        format!("KEY={ID}/sshKey.privateKey"),
+        format!("PUB={ID}/sshKey.publicKey"),
+        format!("FP={ID}/sshKey.keyFingerprint"),
+    ];
+    let run = f.call(&["run", "--env", &mappings[0], "--env", &mappings[1], "--env", &mappings[2], "--", "/usr/bin/python3", "-c",
+        "import os; assert os.environ['KEY'] == '-----BEGIN OPENSSH PRIVATE KEY-----\\nCANARY_SYNTHETIC_KEY\\n-----END OPENSSH PRIVATE KEY-----\\n'; assert os.environ['PUB'] == 'CANARY_PUBLIC'; assert os.environ['FP'] == 'CANARY_FINGERPRINT'; assert 'BW_SESSION' not in os.environ"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    public(&run);
+    for format in ["--dotenv", "--zshrc"] {
+        let path = f.path(if format == "--dotenv" {
+            "ssh.env"
+        } else {
+            "ssh.zsh"
+        });
+        let written = f.call(&[
+            "write",
+            "--env",
+            &mappings[0],
+            format,
+            path.to_str().unwrap(),
+        ]);
+        public(&written);
+        if format == "--dotenv" {
+            assert!(!written.status.success());
+            assert!(!path.exists());
+            assert!(
+                String::from_utf8_lossy(&written.stderr)
+                    .contains("dotenv cannot store a multiline secret")
+            );
+        } else {
+            assert!(written.status.success());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let output = Command::new("zsh")
+                .args(["-fc", "source \"$1\"; print -rn -- \"$KEY\"", "--"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, key.as_bytes());
+        }
+    }
+}

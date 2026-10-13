@@ -60,7 +60,7 @@ pub(crate) fn manifest() -> Value {
         },
         "bindings": {
             "syntax": "NAME=ITEM_UUID/FIELD",
-            "fields": ["login.username", "login.password", "custom.NAME"],
+            "fields": ["login.username", "login.password", "sshKey.privateKey", "sshKey.publicKey", "sshKey.keyFingerprint", "custom.NAME"],
             "item_identifier": "uuid",
             "environment_name_pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
             "reserved_environment_prefixes": ["BW_", "BITWARDENCLI_", "LATCH_"],
