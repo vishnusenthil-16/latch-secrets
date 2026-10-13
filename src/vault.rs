@@ -32,11 +32,11 @@ pub(crate) fn parse_bindings(values: &[String]) -> Result<Vec<Binding>> {
                 .hyphenated()
                 .to_string();
             ensure!(
-                matches!(field, "login.username" | "login.password")
+                matches!(field, "login.username" | "login.password" | "sshKey.privateKey" | "sshKey.publicKey" | "sshKey.keyFingerprint")
                     || field
                         .strip_prefix("custom.")
                         .is_some_and(|name| !name.is_empty()),
-                "supported fields: login.username, login.password, custom.NAME"
+                "supported fields: login.username, login.password, sshKey.privateKey, sshKey.publicKey, sshKey.keyFingerprint, custom.NAME"
             );
             Ok(Binding {
                 name: name.to_owned(),
@@ -116,6 +116,14 @@ pub(crate) fn resolve(
             item["login"][field]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("requested login field is missing"))?
+        } else if let Some(field) = binding.field.strip_prefix("sshKey.") {
+            ensure!(
+                item["type"].as_u64() == Some(5),
+                "requested item is not an SSH key"
+            );
+            item["sshKey"][field]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("requested SSH key field is missing"))?
         } else {
             let name = binding
                 .field
@@ -168,6 +176,31 @@ mod tests {
         assert_eq!(values[1].1, "t");
         assert!(resolve(&bindings, |_| Ok(json!({"id":ID,"login":{"password":"p"},"fields":[{"name":"token","type":1,"value":"t"},{"name":"token","type":1,"value":"u"}]}).to_string())).is_err());
     }
+    #[test]
+    fn ssh_fields_reject_invalid_items_and_selectors() {
+        let bindings = parse_bindings(&[format!("KEY={ID}/sshKey.privateKey")]).unwrap();
+        for item in [
+            json!({"id":ID,"type":1,"sshKey":{"privateKey":"CANARY"}}),
+            json!({"id":ID,"type":5}),
+            json!({"id":ID,"type":5,"sshKey":{"privateKey":null}}),
+            json!({"id":ID,"type":5,"sshKey":{"privateKey":123}}),
+            json!({"id":ID,"type":5,"sshKey":{"privateKey":"CANARY\u{0}"}}),
+            json!({"id":ID,"type":5,"deletedDate":"deleted","sshKey":{"privateKey":"CANARY"}}),
+            json!({"id":"wrong","type":5,"sshKey":{"privateKey":"CANARY"}}),
+        ] {
+            let error = resolve(&bindings, |_| Ok(item.to_string())).unwrap_err();
+            assert!(!error.to_string().contains("CANARY"));
+        }
+        for field in [
+            "sshKey",
+            "sshKey.",
+            "sshKey.fingerprint",
+            "sshKey.privateKey.extra",
+        ] {
+            assert!(parse_bindings(&[format!("KEY={ID}/{field}")]).is_err());
+        }
+    }
+
     #[test]
     fn reject_invalid_and_duplicate_bindings() {
         for mappings in [

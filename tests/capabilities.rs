@@ -63,7 +63,14 @@ fn discovery_needs_no_home_backend_or_state_and_is_read_only() {
     }
     assert_eq!(
         manifest["bindings"]["fields"],
-        serde_json::json!(["login.username", "login.password", "custom.NAME"])
+        serde_json::json!([
+            "login.username",
+            "login.password",
+            "sshKey.privateKey",
+            "sshKey.publicKey",
+            "sshKey.keyFingerprint",
+            "custom.NAME"
+        ])
     );
     assert_eq!(
         manifest["output"]["operational_error_with_json"]["error"]["code"],
