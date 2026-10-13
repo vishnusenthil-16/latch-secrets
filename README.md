@@ -92,7 +92,24 @@ Both `run` and `write` accept repeated `--env NAME=ITEM_UUID/FIELD` arguments.
 | --- | --- |
 | `login.username` | Login username |
 | `login.password` | Login password |
+| `sshKey.privateKey` | SSH private key (multiline text preserved) |
+| `sshKey.publicKey` | SSH public key |
+| `sshKey.keyFingerprint` | SSH key fingerprint |
 | `custom.NAME` | Exactly named text or hidden custom field |
+
+SSH selectors read native SSH-key items (type `5`) through the existing `run`
+and `write` commands. For example, load a selected key into an already-running
+SSH agent without writing a key file:
+
+```sh
+latch run --env SSH_PRIVATE_KEY=00000000-0000-4000-8000-000000000001/sshKey.privateKey \
+  -- sh -c 'printf "%s\n" "$SSH_PRIVATE_KEY" | ssh-add -'
+```
+
+`write --dotenv` and `write --zshrc` store environment assignments, not raw SSH
+identity files. Multiline private keys work with `run` and `write --zshrc`;
+`write --dotenv` rejects multiline values. SSH-key creation, mutation, and an
+integrated SSH agent remain unsupported.
 
 Use item UUIDs returned by `list`; item names are not selectors. Missing fields, ambiguous custom-field names, duplicate variable mappings, unsupported types, and NUL bytes fail before a command starts or a destination changes. Empty strings are valid. Variable names beginning with `BW_`, `BITWARDENCLI_`, or `LATCH_` are reserved.
 
