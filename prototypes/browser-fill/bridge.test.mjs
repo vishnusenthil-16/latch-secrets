@@ -73,7 +73,7 @@ test('real native host + MV3 extension: existing document, isolated fill, naviga
     await context.route('https://example.test/**',r=>r.fulfill({contentType:'text/html',body:'<input id="p" type="password">'}));
     const page=await context.newPage();await page.goto('https://example.test/login');
     let socket;
-    for(let i=0;i<50;i++){socket=(await readdir(runtime).catch(()=>[])).find(s=>!before.includes(s));if(socket)break;await new Promise(r=>setTimeout(r,20));}
+    for(let i=0;i<50;i++){socket=(await readdir(runtime).catch(()=>[])).find(s=>s.endsWith(".sock")&&!before.includes(s));if(socket)break;await new Promise(r=>setTimeout(r,20));}
     assert.ok(socket,'Chrome must launch the installed native host');
     const call = request => new Promise((resolve,reject)=>{
       const stream=createConnection(join(runtime,socket));
@@ -107,5 +107,27 @@ test('real native host + MV3 extension: existing document, isolated fill, naviga
     assert.equal(await page.locator('#p').inputValue(),'');
     targets=await discover();await page.locator('#p').evaluate(e=>e.style.opacity='0');
     assert.deepEqual(await fill(targets[0].handle),{status:'rejected'});
+    // Reload a real extension: the old Chrome-launched host must disappear and
+    // its replacement must be reachable, with no abandoned instance files.
+    const previous=socket;
+    const extensionId=(await readFile(new URL('../../browser/extension-id.txt',import.meta.url),'utf8')).trim();
+    const manager=await context.newPage();
+    await manager.goto('chrome://extensions');
+    await manager.evaluate(()=>new Promise(r=>chrome.developerPrivate.updateProfileConfiguration({inDeveloperMode:true},r)));
+    await manager.evaluate(id=>new Promise((resolve,reject)=>{
+      chrome.developerPrivate.reload(id,{failQuietly:false},()=>{
+        if(chrome.runtime.lastError)reject(new Error(chrome.runtime.lastError.message));else resolve();
+      });
+    }),extensionId);
+    for(let i=0;i<200;i++) {
+      const entries=await readdir(runtime);
+      const next=entries.find(s=>s.endsWith('.sock')&&s!==previous);
+      if(next&&!entries.includes(previous)&&!entries.includes(previous.replace('.sock','.lock'))) {
+        socket=next;break;
+      }
+      await new Promise(r=>setTimeout(r,25));
+    }
+    assert.notEqual(socket,previous,'extension reload must replace host and remove old files');
+    assert.equal((await discover()).length,1);
   } finally {await context.close();await rm(dir,{recursive:true,force:true});}
 });

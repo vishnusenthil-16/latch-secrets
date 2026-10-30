@@ -4,12 +4,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     ffi::{CStr, OsStr},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::fd::AsRawFd,
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -234,10 +234,102 @@ fn sanitize_reply(bytes: &[u8], fill: bool) -> Result<Value> {
     }
     Ok(json!({"status":"ok","targets":result}))
 }
-struct SocketFile(PathBuf);
-impl Drop for SocketFile {
+// A lock proves liveness, never a successful connection. IDs are never reused.
+struct InstanceFiles {
+    lock: File,
+    path: PathBuf,
+}
+fn same_lock(file: &File, path: &Path) -> bool {
+    let (Ok(fd), Ok(named)) = (file.metadata(), fs::symlink_metadata(path)) else {
+        return false;
+    };
+    fd.nlink() == 1 && fd.dev() == named.dev() && fd.ino() == named.ino()
+}
+impl InstanceFiles {
+    #[cfg(not(target_os = "macos"))]
+    fn create(_path: PathBuf) -> Result<Self> {
+        bail!("browser bridge currently supports macOS only")
+    }
+    #[cfg(target_os = "macos")]
+    fn create(mut path: PathBuf) -> Result<Self> {
+        for _ in 0..16 {
+            let flags = libc::O_EXLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(flags)
+                .open(&path)?;
+            if same_lock(&lock, &path) {
+                return Ok(Self { lock, path });
+            }
+            // Darwin can expose the inode before O_EXLOCK completes. A cleaner
+            // may win; never bind on that inode or reuse its instance ID.
+            path = path.with_file_name(format!("{}.lock", random_id()?));
+        }
+        bail!("browser lock startup contention; reconnect extension")
+    }
+    fn remove(&self) {
+        if !same_lock(&self.lock, &self.path) {
+            return;
+        }
+        let socket = self.path.with_extension("sock");
+        match fs::symlink_metadata(&socket) {
+            Ok(meta) if meta.file_type().is_socket() && meta.uid() == uid() => {
+                // Retain the lockfile if removal fails, so a later sweep can retry.
+                if let Err(e) = fs::remove_file(&socket)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return,
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+impl Drop for InstanceFiles {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        self.remove();
+    }
+}
+fn cleanup_instances(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|s| s.strip_suffix(".lock")) else {
+            continue;
+        };
+        if id.len() != 32
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(lock) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+        else {
+            continue;
+        };
+        let Ok(meta) = lock.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || meta.uid() != uid() || meta.mode() & 0o077 != 0 {
+            continue;
+        }
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() || !same_lock(&lock, &path) {
+            continue;
+        }
+        // Drop removes socket before lockfile, while the descriptor remains locked.
+        drop(InstanceFiles { lock, path });
     }
 }
 
@@ -246,9 +338,11 @@ pub(crate) fn serve(origin: &str) -> Result<()> {
         origin == format!("chrome-extension://{}/", EXTENSION_ID.trim()),
         "unauthorized extension"
     );
-    let path = runtime_dir()?.join(format!("{}.sock", random_id()?));
+    let dir = runtime_dir()?;
+    cleanup_instances(&dir);
+    let files = InstanceFiles::create(dir.join(format!("{}.lock", random_id()?)))?;
+    let path = files.path.with_extension("sock");
     let listener = UnixListener::bind(&path)?;
-    let _cleanup = SocketFile(path.clone());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     // A bounded reader detects Chrome EOF even when no CLI is connected.
@@ -378,6 +472,7 @@ pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
     let mut connected = 0;
     let mut unavailable = 0;
     let dir = runtime_dir()?;
+    cleanup_instances(&dir);
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -529,6 +624,112 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_lock_lifecycle_and_foreign_entries() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: u32| dir.path().join(format!("{n:032x}.lock"));
+        let live = InstanceFiles::create(path(1)).unwrap();
+        let socket = live.path.with_extension("sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        cleanup_instances(dir.path());
+        assert!(socket.exists()); // A separate open in this process cannot take our lock.
+        drop(live);
+        assert!(!socket.exists());
+        assert!(!path(1).exists());
+
+        // Simulate crash leftovers: lock only and bind-before-chmod socket.
+        for n in [2, 3] {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path(n))
+                .unwrap();
+        }
+        let dead_socket = path(3).with_extension("sock");
+        let _dead = UnixListener::bind(&dead_socket).unwrap();
+        fs::set_permissions(&dead_socket, fs::Permissions::from_mode(0o777)).unwrap();
+        let legacy = path(4).with_extension("sock");
+        let _legacy = UnixListener::bind(&legacy).unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"untouched").unwrap();
+        symlink(&target, path(5)).unwrap();
+        let fifo = std::ffi::CString::new(path(6).as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        fs::write(path(7), b"").unwrap();
+        fs::set_permissions(path(7), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(dir.path().join("bad.lock"), b"").unwrap();
+        cleanup_instances(dir.path());
+        assert!(!path(2).exists());
+        assert!(!path(3).exists());
+        assert!(!dead_socket.exists());
+        assert!(legacy.exists());
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
+        for n in [5, 6, 7] {
+            assert!(fs::symlink_metadata(path(n)).is_ok());
+        }
+        assert!(dir.path().join("bad.lock").exists());
+
+        // A descriptor to an unlinked inode must not authorize deleting a replacement.
+        let old = InstanceFiles::create(path(8)).unwrap();
+        fs::remove_file(path(8)).unwrap();
+        let replacement = InstanceFiles::create(path(8)).unwrap();
+        assert!(!same_lock(&old.lock, &old.path));
+        drop(old);
+        assert!(path(8).exists());
+        drop(replacement);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_races_startup_and_other_cleaners() {
+        let dir = tempfile::Builder::new()
+            .prefix("lc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        for _ in 0..32 {
+            let path = dir.path().join(format!("{}.lock", random_id().unwrap()));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let socket = path.with_extension("sock");
+            drop(UnixListener::bind(socket).unwrap());
+        }
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let dir = dir.path();
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        cleanup_instances(dir);
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            for _ in 0..200 {
+                let lock = InstanceFiles::create(
+                    dir.path().join(format!("{}.lock", random_id().unwrap())),
+                )
+                .unwrap();
+                let socket = lock.path.with_extension("sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                std::thread::yield_now();
+                assert!(lock.path.exists());
+                assert!(UnixStream::connect(&socket).is_ok());
+                drop(listener);
+                let path = lock.path.clone();
+                drop(lock);
+                assert!(!path.exists());
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn os_account_home_ignores_agent_home() {
         if std::env::var_os("LATCH_HOME_TEST_CHILD").is_some() {

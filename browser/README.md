@@ -63,9 +63,11 @@ retry automatically. No separate daemon, credentials service or MCP server is in
 closed profile has no live host. After a host crash or timeout, open the popup and
 select **Connect to Latch** (or reload the extension). Reconnection never replays
 requests. After upgrading from the prototype `/tmp` socket protocol, reload the
-extension to start the updated host before rediscovering targets. Graceful shutdown removes its socket; stale sockets after abrupt kills
-are counted as unavailable, not deleted: a busy live socket can also refuse a connection.
-After closing all browser profiles, stale socket files can be removed manually.
+extension to start the updated host before rediscovering targets. Graceful shutdown removes its socket and lockfile. After crashes, host startup and
+target discovery automatically remove abandoned instances using OS-held locks.
+Busy or suspended hosts are never removed; connection failures do not trigger deletion.
+Older sockets without lockfiles remain manual-cleanup-only, after closing all browser profiles.
+Cleanup is best-effort and runs on next use, not in a background service.
 Discovery waits up to two seconds per host for readiness and reports unavailable connections. Enterprise policies may prohibit unpacked extensions or native messaging.
 
 To uninstall: remove the extension from each profile, remove the exact native-host
@@ -157,12 +159,15 @@ Run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets --
 and `cargo fmt --check`. Rust tests cover policy, framing, response sanitization,
 installation without vault access, origin rejection, 0700/0600 permissions, two
 native-host connections, CLI discovery/fill, disconnect uncertainty and cleanup.
+Cleanup regressions cover SIGKILL/SIGTERM/EOF, suspended hosts, legacy and malformed
+entries, inode replacement, and 200 startups racing eight concurrent cleaners.
 
 After `cargo build --locked`, run `npm ci && npx playwright install chromium && npm test`
 in `prototypes/browser-fill`. Synthetic tests load the MV3 extension in real Chrome
 for Testing with a temporary profile and host registration. Chrome starts the actual
 Latch host; requests go through the Unix socket and native messaging to the existing
-document. They cover filling, replay/navigation/visibility rejection; unit fixtures
+document. They cover extension reload/reconnection and old-instance removal,
+filling, replay/navigation/visibility rejection; unit fixtures
 also cover expiry, inactive documents, exact URL changes and uncertain script results.
 Existing CDP tests cover frames, sandboxed origins, field heuristics and page readback.
 No test reads a real vault or installs anything in your normal Chrome profile.

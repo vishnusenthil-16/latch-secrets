@@ -1023,6 +1023,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
                     .flatten()
                     .flatten()
                     .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "sock"))
                     .collect::<Vec<_>>()
             };
             let before = sockets();
@@ -1083,7 +1084,9 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             });
             let mut socket = None;
             for _ in 0..100 {
-                socket = sockets().into_iter().find(|p| !before.contains(p));
+                socket = sockets()
+                    .into_iter()
+                    .find(|p| p.extension().is_some_and(|e| e == "sock") && !before.contains(p));
                 if socket.is_some() {
                     break;
                 }
@@ -1283,7 +1286,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
         socket = fs::read_dir(&runtime)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .find(|p| !before.contains(p));
+            .find(|p| p.extension().is_some_and(|e| e == "sock") && !before.contains(p));
         if socket.is_some() {
             break;
         }
@@ -1375,4 +1378,62 @@ fn browser_install_is_vault_independent_and_host_origin_is_silent() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn browser_crash_cleanup_and_suspended_host() {
+    use std::process::Stdio;
+    let f = Fixture::new();
+    fs::write(f.path("item.json"),json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}}).to_string()).unwrap();
+    let runtime = f.path(".latch-browser");
+    for signal in [libc::SIGKILL, libc::SIGTERM, 0] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
+            .env("LATCH_BROWSER_HOME", f.dir.path())
+            .arg(format!(
+                "chrome-extension://{}/",
+                include_str!("../browser/extension-id.txt").trim()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let socket = (0..200)
+            .find_map(|_| {
+                let socket = fs::read_dir(&runtime).ok().and_then(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().is_some_and(|e| e == "sock"))
+                });
+                if socket.is_none() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                socket
+            })
+            .expect("host starts");
+        let lock = socket.with_extension("lock");
+        assert!(lock.exists());
+        if signal == libc::SIGKILL {
+            // SAFETY: signal our own live child. A stopped host remains locked.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) }, 0);
+            let out = f.call(&["browser", "targets", "--item", ID, "--json"]);
+            assert!(!out.status.success());
+            assert!(lock.exists() && socket.exists());
+        }
+        if signal == 0 {
+            drop(child.stdin.take());
+        } else {
+            // SAFETY: signal our own live child.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        }
+        child.wait().unwrap();
+        if signal != 0 {
+            assert!(lock.exists() && socket.exists());
+        }
+        let out = f.call(&["browser", "targets", "--item", ID, "--json"]);
+        assert!(!out.status.success());
+        assert!(!socket.exists() && !lock.exists());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("browser bridge unavailable"));
+    }
 }
