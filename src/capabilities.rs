@@ -34,7 +34,7 @@ pub(crate) fn manifest() -> Value {
                 "arguments": arguments,
                 "help_command": ["latch", name, "--help"],
                 "requires_interactive_terminal": name == "login",
-                "requires_stored_session": matches!(name, "sync" | "list" | "run" | "write" | "create" | "update" | "delete"),
+                "requires_stored_session": matches!(name, "browser" | "sync" | "list" | "run" | "write" | "create" | "update" | "delete"),
             })
         })
         .collect();
@@ -98,6 +98,17 @@ pub(crate) fn manifest() -> Value {
             "failure": "backend delete failures have uncertain outcome; inspect vault before retrying",
             "success": {"id": "ITEM_UUID", "deleted": true, "permanent": false},
             "credential_effect": "deleted items cannot be injected by run/write; previously written files and provider credentials remain unchanged"
+        },
+        "browser_fill": {
+            "command": ["latch", "browser", "fill"],
+            "required_flags": ["item", "endpoint", "target", "selector"],
+            "runtime": "Node.js 22.4+ on PATH; Chromium browser WebSocket endpoint on numeric loopback",
+            "implicit_sync": true,
+            "submission": false,
+            "automatic_retry": false,
+            "destination_policy": "vault HTTPS URIs only; explicit base-domain/host narrowed to exact origin, exact retains full URL; other modes ignored; reprompt must be 0",
+            "secret_transport": "private stdin pipe, never arguments or environment",
+            "failure": "unknown outcome may already have filled; inspect before retrying"
         },
         "credential_delivery": {
             "run": {

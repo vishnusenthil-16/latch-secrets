@@ -935,3 +935,66 @@ fn ssh_key_read_preserves_multiline_values_and_metadata_privacy() {
         }
     }
 }
+
+#[test]
+fn browser_cli_enforces_policy_and_private_transport() {
+    let f = Fixture::new();
+    let item = json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}});
+    fs::write(f.path("item.json"), item.to_string()).unwrap();
+    // Synthetic adapter validates the production CLI's pipe and sanitized env.
+    fs::write(f.path("node"), r#"#!/usr/bin/python3
+import json, os, sys
+assert 'CANARY' not in ' '.join(sys.argv)
+assert not any(k in os.environ for k in ['BW_SESSION','NODE_OPTIONS','DEBUG','PWDEBUG','EXTRA_SECRET'])
+p = json.load(sys.stdin)
+assert p['value'].startswith('CANARY_latch_')
+assert p['rules'] == [{'origin':'https://example.test','exact':'https://example.test/login'}]
+# Deliberate output must be discarded, even on failures.
+print(p['value']); print(p['value'],file=sys.stderr)
+sys.exit(10 if p['target']=='reject' else 11 if p['target']=='unknown' else 0)
+"#).unwrap();
+    fs::set_permissions(f.path("node"), fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |target: &str| {
+        f.command()
+            .env("PATH", f.dir.path())
+            .env("NODE_OPTIONS", "--invalid")
+            .env("DEBUG", "*")
+            .env("EXTRA_SECRET", "CANARY_PARENT")
+            .args([
+                "browser",
+                "fill",
+                "--item",
+                ID,
+                "--endpoint",
+                "ws://127.0.0.1:9222/devtools/browser/test",
+                "--target",
+                target,
+                "--selector",
+                "#p",
+            ])
+            .output()
+            .unwrap()
+    };
+    let out = run("target");
+    public(&out);
+    assert!(out.status.success(), "{:?}", out);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"status":"filled","fields":1})
+    );
+    for target in ["reject", "unknown"] {
+        let out = run(target);
+        public(&out);
+        assert!(!out.status.success());
+    }
+    for value in [json!(1), json!(null)] {
+        let mut changed = item.clone();
+        changed["reprompt"] = value;
+        fs::write(f.path("item.json"), changed.to_string()).unwrap();
+        let out = run("target");
+        public(&out);
+        assert!(!out.status.success());
+    }
+    let calls = fs::read_to_string(f.path("calls")).unwrap();
+    assert!(calls.contains("sync\nget\n"));
+}

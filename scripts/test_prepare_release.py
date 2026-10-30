@@ -25,6 +25,7 @@ class ReleaseFixture(unittest.TestCase):
         for rel, content in {
             "Cargo.toml": '[package]\nname = "latch-secrets"\nversion = "0.1.0"\n',
             "Cargo.lock": "# lock\n", "LICENSE": "license\n", "README.md": "readme\n",
+            "browser/driver.mjs": "// embedded driver\n", "browser/README.md": "browser docs\n",
             "src/main.rs": "fn main() {}\n", "tests/cli.rs": "test\n",
             "skills/latch/SKILL.md": "skill\n", ".env": "DO_NOT_PACKAGE\n",
             ".gitignore": "src/ignored.rs\nsrc/.env\n",
@@ -74,6 +75,8 @@ class ReleaseFixture(unittest.TestCase):
         with tarfile.open(one / archive_name, "r:gz") as tar:
             names = tar.getnames()
             self.assertIn("latch-secrets-0.1.0/src/main.rs", names)
+            self.assertIn("latch-secrets-0.1.0/browser/driver.mjs", names)
+            self.assertIn("latch-secrets-0.1.0/browser/README.md", names)
             self.assertNotIn("latch-secrets-0.1.0/.env", names)
             self.assertNotIn("latch-secrets-0.1.0/src/.env", names)
             self.assertNotIn("latch-secrets-0.1.0/src/ignored.rs", names)

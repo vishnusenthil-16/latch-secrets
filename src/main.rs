@@ -1,3 +1,4 @@
+mod browser;
 mod bw;
 mod capabilities;
 mod config;
@@ -74,6 +75,11 @@ enum Action {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    /// Fill a browser password field using vault-owned destination policy.
+    Browser {
+        #[command(subcommand)]
+        command: BrowserAction,
+    },
     /// Persist plaintext credentials into an owner-only file.
     Write {
         #[arg(long = "env", required = true)]
@@ -89,6 +95,22 @@ enum Action {
     Doctor,
     #[command(hide = true)]
     SessionServe,
+}
+
+#[derive(Subcommand)]
+enum BrowserAction {
+    /// Fill one main-frame password input; never submit or retry.
+    Fill {
+        #[arg(long)]
+        item: String,
+        /// Loopback browser WebSocket endpoint, not an HTTP discovery URL.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        selector: String,
+    },
 }
 
 fn main() {
@@ -303,6 +325,30 @@ fn execute(cli: &Cli) -> Result<()> {
         Action::Delete { item_uuid } => {
             let token = Zeroizing::new(session::get(&state.root)?);
             output(mutate::delete(&backend, &token, item_uuid)?, cli.json);
+        }
+        Action::Browser {
+            command:
+                BrowserAction::Fill {
+                    item,
+                    endpoint,
+                    target,
+                    selector,
+                },
+        } => {
+            browser::validate(endpoint, target, selector)?;
+            let id = uuid::Uuid::parse_str(item)
+                .map_err(|_| anyhow::anyhow!("item must be a UUID"))?
+                .hyphenated()
+                .to_string();
+            let token = Zeroizing::new(session::get(&state.root)?);
+            backend.call(&["sync"], Some(&token))?;
+            let raw = Zeroizing::new(backend.call(&["get", "item", &id], Some(&token))?);
+            let payload = browser::payload(&raw, &id, endpoint, target, selector)?;
+            drop(raw);
+            drop(token);
+            drop(_guard);
+            browser::deliver(&payload)?;
+            output(json!({"status":"filled","fields":1}), cli.json);
         }
         Action::Run { bindings, .. } | Action::Write { bindings, .. } => {
             let selections = vault::parse_bindings(bindings)?;

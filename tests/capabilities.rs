@@ -48,6 +48,7 @@ fn discovery_needs_no_home_backend_or_state_and_is_read_only() {
             "update",
             "delete",
             "run",
+            "browser",
             "write",
             "lock",
             "doctor"
