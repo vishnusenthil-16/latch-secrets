@@ -1,6 +1,6 @@
 ---
 name: latch
-description: Discover, create, update, rotate, and soft-delete stored vault credentials, or inject selected credentials into commands or explicitly requested files using the Latch CLI.
+description: Discover, create, update, rotate, and soft-delete stored vault credentials, or inject selected credentials into commands or explicitly requested files using the Latch CLI, including vault-reference password filling in authorized Chrome sessions.
 ---
 
 # Latch
@@ -52,3 +52,9 @@ browser tools can still read values. Never automatically retry `outcome_unknown`
 If the bridge is unavailable, ask the user to enable/connect the extension; do not
 retrieve the password into agent context as a fallback. See `browser/README.md`
 for supported explicit URI modes, installation and limitations.
+
+After upgrading Latch, rerun `browser install-host` for the intended browser, reload
+the extension, and rediscover targets. Host startup and target discovery automatically
+clean abandoned socket/lock pairs after crashes; live or suspended hosts are left
+alone. Legacy sockets without locks require manual cleanup after closing all browser
+profiles. Do not delete sockets merely because a connection fails.
