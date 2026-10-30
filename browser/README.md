@@ -52,12 +52,16 @@ and rediscover targets. Prefer an installed binary outside macOS-protected Docum
 folders; Chrome-launched executables there can be blocked by macOS privacy controls.
 
 Chrome starts the host when the extension connects. The same binary creates a
-random socket in `/tmp/latch-browser-UID` (0700 directory, 0600 socket, same-UID peer
-checks). No separate daemon, credentials service or MCP server is installed. A
+random socket in `$HOME/.latch-browser` (0700 directory, 0600 socket, same-UID peer
+checks). CLI and Chrome must use the same HOME. Clients wait for a host-ready
+handshake before sending a password, so a request that times out while queued
+cannot later fill. Once dispatched, a timeout is still `outcome_unknown`; never
+retry automatically. No separate daemon, credentials service or MCP server is installed. A
 closed profile has no live host. After a host crash or timeout, open the popup and
 select **Connect to Latch** (or reload the extension). Reconnection never replays
-requests. Graceful shutdown removes its socket; stale sockets after abrupt kills
-are ignored. Enterprise policies may prohibit unpacked extensions or native messaging.
+requests. After upgrading from the prototype `/tmp` socket protocol, reload the
+extension to start the updated host before rediscovering targets. Graceful shutdown removes its socket; stale sockets after abrupt kills
+are removed on discovery when the connection is refused. Enterprise policies may prohibit unpacked extensions or native messaging.
 
 To uninstall: remove the extension from each profile, remove the exact native-host
 manifest path returned by installation, and remove the extracted extension directory

@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, cp, readdir} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {createConnection} from 'node:net';
@@ -55,7 +54,7 @@ test('bridge document binding, single use, expiry, schema, policy, and uncertain
 });
 
 test('real native host + MV3 extension: existing document, isolated fill, navigation and replay',async()=>{
-  const dir=await mkdtemp(join(tmpdir(),'latch-extension-test-'));
+  const dir=await mkdtemp('/tmp/latch-ext-');
   const extension=join(dir,'extension');
   await cp(new URL('../../browser/extension/',import.meta.url),extension,{recursive:true});
   const manifest=JSON.parse(await readFile(join(extension,'manifest.json'),'utf8'));
@@ -65,7 +64,7 @@ test('real native host + MV3 extension: existing document, isolated fill, naviga
   const binary=join(dir,'latch');
   await cp(new URL('../../target/debug/latch',import.meta.url),binary);
   execFileSync(binary,['browser','install-host','--browser','chrome-for-testing','--user-data-dir',join(dir,'profile')],{env:{...process.env,HOME:dir}});
-  const runtime=`/tmp/latch-browser-${process.getuid()}`;
+  const runtime=join(dir,'.latch-browser');
   const before=await readdir(runtime).catch(()=>[]);
   const context=await chromium.launchPersistentContext(join(dir,'profile'),{channel:'chromium',headless:true,env:{...process.env,HOME:dir},
     args:[`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
@@ -81,15 +80,19 @@ test('real native host + MV3 extension: existing document, isolated fill, naviga
       let response=Buffer.alloc(0);
       stream.setTimeout(20_000,()=>stream.destroy(new Error('bridge timeout')));
       stream.on('error',reject);
-      stream.on('connect',()=>{
-        const body=Buffer.from(JSON.stringify(request));
-        const header=Buffer.alloc(4);header.writeUInt32LE(body.length);
-        stream.write(Buffer.concat([header,body]));
-      });
+      let ready=false;
       stream.on('data',chunk=>{
         response=Buffer.concat([response,chunk]);
-        if(response.length>=4 && response.length>=4+response.readUInt32LE(0)){
-          stream.end();resolve(JSON.parse(response.subarray(4).toString()));
+        while(response.length>=4 && response.length>=4+response.readUInt32LE(0)){
+          const size=response.readUInt32LE(0);
+          const result=JSON.parse(response.subarray(4,4+size).toString());
+          response=response.subarray(4+size);
+          if(!ready){
+            assert.deepEqual(result,{status:'ready'});ready=true;
+            const body=Buffer.from(JSON.stringify(request));
+            const header=Buffer.alloc(4);header.writeUInt32LE(body.length);
+            stream.write(Buffer.concat([header,body]));
+          }else{stream.end();resolve(result);}
         }
       });
     });

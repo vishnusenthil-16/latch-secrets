@@ -26,8 +26,12 @@ fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 fn runtime_dir() -> Result<PathBuf> {
-    // Fixed per OS user, independent of vault state-dir and Chrome environment.
-    let dir = PathBuf::from(format!("/tmp/latch-browser-{}", uid()));
+    // Private per-user location, independent of vault state-dir. Chrome and
+    // CLI must share HOME; tests use a disposable home for isolation.
+    let home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME unavailable"))?);
+    ensure!(home.is_absolute(), "HOME must be absolute");
+    let dir = home.join(".latch-browser");
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
@@ -244,15 +248,33 @@ pub(crate) fn serve(origin: &str) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
             Err(_) => bail!("browser listener failed"),
         };
         // macOS accepted sockets inherit the listener's nonblocking flag.
-        stream.set_nonblocking(false)?;
-        if verify_peer(&stream).is_err() {
+        if stream.set_nonblocking(false).is_err()
+            || verify_peer(&stream).is_err()
+            || stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .is_err()
+            || stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .is_err()
+        {
             continue;
         }
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // Do not accept a payload until this host is ready to dispatch it. A
+        // caller that times out in the backlog never sends a password.
+        if write_frame(&mut stream, br#"{"status":"ready"}"#).is_err() {
+            continue;
+        }
         let Ok(bytes) = read_frame(&mut stream) else {
             continue;
         };
@@ -292,11 +314,23 @@ fn connect(instance: &str) -> Result<UnixStream> {
         m.file_type().is_socket() && m.uid() == uid() && m.mode() & 0o077 == 0,
         "insecure browser socket"
     );
-    let stream =
-        UnixStream::connect(path).map_err(|_| anyhow::anyhow!("browser bridge unavailable"))?;
+    let mut stream = UnixStream::connect(&path).map_err(|e| {
+        // Only ECONNREFUSED proves there is no listener. Never unlink a busy
+        // or inaccessible socket. The directory is private to this user.
+        if e.kind() == std::io::ErrorKind::ConnectionRefused {
+            let _ = fs::remove_file(&path);
+        }
+        anyhow::anyhow!("browser bridge unavailable")
+    })?;
     verify_peer(&stream)?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let ready = read_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("browser bridge busy or unavailable; no request sent"))?;
+    ensure!(
+        &*ready == br#"{"status":"ready"}"#,
+        "incompatible browser host; reconnect extension"
+    );
     Ok(stream)
 }
 pub(crate) fn targets(rules: &[Value]) -> Result<Value> {

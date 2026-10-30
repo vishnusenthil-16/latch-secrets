@@ -157,6 +157,7 @@ else: sys.exit(7)
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_latch"));
         command
+            .env("HOME", self.dir.path())
             .arg("--state-dir")
             .arg(self.dir.path())
             .arg("--json")
@@ -1013,11 +1014,8 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
         socket: PathBuf,
     }
     impl Host {
-        fn start(label: &'static str) -> Self {
-            let runtime = PathBuf::from(format!(
-                "/tmp/latch-browser-{}",
-                fs::metadata(".").unwrap().uid()
-            ));
+        fn start(label: &'static str, home: &std::path::Path) -> Self {
+            let runtime = home.join(".latch-browser");
             let sockets = || {
                 fs::read_dir(&runtime)
                     .into_iter()
@@ -1028,6 +1026,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             };
             let before = sockets();
             let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
+                .env("HOME", home)
                 .arg(format!(
                     "chrome-extension://{}/",
                     include_str!("../browser/extension-id.txt").trim()
@@ -1056,6 +1055,12 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
                         assert_eq!(req["value"], SECRET);
                         assert_eq!(req["handle"], ID);
                         assert_eq!(req["rules"][0]["exact"], "https://example.test/login");
+                        if req["selector"] == "#slow" {
+                            thread::sleep(Duration::from_secs(11));
+                        }
+                        if req["selector"] == "#no-reply" {
+                            continue; // Chrome consumed the payload but never answers.
+                        }
                         if req["selector"] == "#disconnect" {
                             writer.lock().unwrap().take();
                             break;
@@ -1119,11 +1124,16 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             );
         }
     }
-    let first = Host::start("Bridge fixture A");
-    let second = Host::start("Bridge fixture B");
     let f = Fixture::new();
+    let first = Host::start("Bridge fixture A", f.dir.path());
+    let second = Host::start("Bridge fixture B", f.dir.path());
     fs::write(f.path("item.json"),json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}}).to_string()).unwrap();
+    let stale = f.path(".latch-browser/11111111111111111111111111111111.sock");
+    let listener = UnixListener::bind(&stale).unwrap();
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(listener);
     let out = f.call(&["browser", "targets", "--item", ID]);
+    assert!(!stale.exists(), "discovery removes refused stale sockets");
     public(&out);
     assert!(out.status.success(), "{out:?}");
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -1141,6 +1151,56 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
         .as_str()
         .unwrap();
     assert_ne!(a, b);
+    assert_eq!(
+        targets.len(),
+        2,
+        "only isolated fixture hosts are discovered"
+    );
+    // Two 11-second fills exceed the old 20-second client timeout when
+    // serialized. The second client now waits before sending its payload.
+    let other_vault = Fixture::new();
+    fs::copy(f.path("item.json"), other_vault.path("item.json")).unwrap();
+    thread::scope(|scope| {
+        let run = |vault: &Fixture| {
+            let out = vault
+                .command()
+                .env("HOME", f.dir.path())
+                .args([
+                    "browser",
+                    "fill",
+                    "--item",
+                    ID,
+                    "--target",
+                    a,
+                    "--selector",
+                    "#slow",
+                ])
+                .output()
+                .unwrap();
+            public(&out);
+            assert!(out.status.success(), "{out:?}");
+        };
+        let f_ref = &f;
+        let other_ref = &other_vault;
+        let first = scope.spawn(move || run(f_ref));
+        let second = scope.spawn(move || run(other_ref));
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+    // A caller that abandons the ready queue sends no payload and cannot
+    // produce a later native request. Block accept briefly with an idle peer.
+    let mut idle = std::os::unix::net::UnixStream::connect(&first.socket).unwrap();
+    let mut header = [0; 4];
+    idle.read_exact(&mut header).unwrap();
+    let mut ready = vec![0; u32::from_ne_bytes(header) as usize];
+    idle.read_exact(&mut ready).unwrap();
+    let mut abandoned = std::os::unix::net::UnixStream::connect(&first.socket).unwrap();
+    abandoned
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert!(abandoned.read(&mut [0; 1]).is_err());
+    drop(abandoned);
+    drop(idle);
     for (target, selector, status) in [
         (a, "#p", "filled"),
         (b, "#reject", "rejected"),
@@ -1157,12 +1217,27 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             selector,
         ]);
         public(&out);
-        assert_eq!(out.status.success(), status == "filled");
+        assert_eq!(out.status.success(), status == "filled", "{out:?}");
         assert_eq!(
             serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"],
             status
         );
     }
+    let out = f.call(&[
+        "browser",
+        "fill",
+        "--item",
+        ID,
+        "--target",
+        a,
+        "--selector",
+        "#no-reply",
+    ]);
+    public(&out);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"],
+        "outcome_unknown"
+    );
     drop(second);
     drop(first);
     let out = f.call(&[
@@ -1179,15 +1254,13 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
     assert!(!out.status.success());
     // A stopped Chrome reader must not block native pipe writes forever. This
     // payload exceeds pipe capacity; never read or print the host's stdout.
-    let runtime = PathBuf::from(format!(
-        "/tmp/latch-browser-{}",
-        fs::metadata(".").unwrap().uid()
-    ));
+    let runtime = f.path(".latch-browser");
     let before = fs::read_dir(&runtime)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect::<Vec<_>>();
     let mut stalled = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .env("HOME", f.dir.path())
         .arg(format!(
             "chrome-extension://{}/",
             include_str!("../browser/extension-id.txt").trim()
@@ -1216,6 +1289,14 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();
+    let mut ready_header = [0; 4];
+    stream.read_exact(&mut ready_header).unwrap();
+    let mut ready = vec![0; u32::from_ne_bytes(ready_header) as usize];
+    stream.read_exact(&mut ready).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ready).unwrap(),
+        json!({"status":"ready"})
+    );
     let bytes = serde_json::to_vec(&json!({"op":"fill","handle":ID,"selector":"#p",
         "rules":[{"origin":"https://example.test","exact":null}],"value":"X".repeat(128*1024)}))
     .unwrap();
