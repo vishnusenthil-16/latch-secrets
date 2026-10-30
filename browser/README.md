@@ -52,8 +52,11 @@ and rediscover targets. Prefer an installed binary outside macOS-protected Docum
 folders; Chrome-launched executables there can be blocked by macOS privacy controls.
 
 Chrome starts the host when the extension connects. The same binary creates a
-random socket in `$HOME/.latch-browser` (0700 directory, 0600 socket, same-UID peer
-checks). CLI and Chrome must use the same HOME. Clients wait for a host-ready
+random socket in `<OS-account-home>/.latch-browser` (0700 directory, 0600 socket, same-UID peer
+checks). The OS account database supplies the home for both discovery and installation;
+agent overrides of `HOME` do not affect it. Synthetic tests can explicitly set
+`LATCH_BROWSER_HOME` to the same absolute directory for CLI and Chrome. Socket
+paths must fit macOS’s 104-byte limit (home paths up to 51 bytes). Clients wait for a host-ready
 handshake before sending a password, so a request that times out while queued
 cannot later fill. Once dispatched, a timeout is still `outcome_unknown`; never
 retry automatically. No separate daemon, credentials service or MCP server is installed. A
@@ -61,7 +64,9 @@ closed profile has no live host. After a host crash or timeout, open the popup a
 select **Connect to Latch** (or reload the extension). Reconnection never replays
 requests. After upgrading from the prototype `/tmp` socket protocol, reload the
 extension to start the updated host before rediscovering targets. Graceful shutdown removes its socket; stale sockets after abrupt kills
-are removed on discovery when the connection is refused. Enterprise policies may prohibit unpacked extensions or native messaging.
+are counted as unavailable, not deleted: a busy live socket can also refuse a connection.
+After closing all browser profiles, stale socket files can be removed manually.
+Discovery waits up to two seconds per host for readiness and reports unavailable connections. Enterprise policies may prohibit unpacked extensions or native messaging.
 
 To uninstall: remove the extension from each profile, remove the exact native-host
 manifest path returned by installation, and remove the extracted extension directory

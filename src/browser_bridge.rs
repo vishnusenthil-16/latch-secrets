@@ -3,10 +3,12 @@ use anyhow::{Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    ffi::{CStr, OsStr},
     fs::{self, File},
     io::{Read, Write},
     os::fd::AsRawFd,
     os::unix::{
+        ffi::OsStrExt,
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
@@ -25,12 +27,52 @@ fn uid() -> u32 {
     // SAFETY: geteuid takes no arguments and has no preconditions.
     unsafe { libc::geteuid() }
 }
+// Resolve the OS account, not an agent-specific HOME environment override.
+fn account_home() -> Result<PathBuf> {
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: record, result and buffer are writable for the supplied sizes.
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid(),
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        ensure!(
+            code == 0 && !result.is_null(),
+            "OS account home unavailable"
+        );
+        // SAFETY: success with a non-null result initializes record; pw_dir is
+        // a NUL-terminated string in buffer, copied before buffer is dropped.
+        let record = unsafe { record.assume_init() };
+        ensure!(!record.pw_dir.is_null(), "OS account home unavailable");
+        let home = PathBuf::from(OsStr::from_bytes(unsafe {
+            CStr::from_ptr(record.pw_dir).to_bytes()
+        }));
+        ensure!(home.is_absolute(), "OS account home must be absolute");
+        return Ok(home);
+    }
+}
+fn browser_home() -> Result<PathBuf> {
+    // Explicit isolation override for synthetic tests. Both processes must agree.
+    if let Some(home) = std::env::var_os("LATCH_BROWSER_HOME") {
+        let home = PathBuf::from(home);
+        ensure!(home.is_absolute(), "LATCH_BROWSER_HOME must be absolute");
+        return Ok(home);
+    }
+    account_home()
+}
 fn runtime_dir() -> Result<PathBuf> {
-    // Private per-user location, independent of vault state-dir. Chrome and
-    // CLI must share HOME; tests use a disposable home for isolation.
-    let home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME unavailable"))?);
-    ensure!(home.is_absolute(), "HOME must be absolute");
+    let home = browser_home()?;
     let dir = home.join(".latch-browser");
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => (),
@@ -302,7 +344,7 @@ pub(crate) fn serve(origin: &str) -> Result<()> {
         let _ = write_frame(&mut stream, &serde_json::to_vec(&sanitized)?);
     }
 }
-fn connect(instance: &str) -> Result<UnixStream> {
+fn connect(instance: &str, ready_timeout: Duration) -> Result<UnixStream> {
     ensure!(valid_instance(instance), "invalid browser target");
     let path = runtime_dir()?.join(format!("{instance}.sock"));
     let m = fs::symlink_metadata(&path).map_err(|_| {
@@ -314,16 +356,12 @@ fn connect(instance: &str) -> Result<UnixStream> {
         m.file_type().is_socket() && m.uid() == uid() && m.mode() & 0o077 == 0,
         "insecure browser socket"
     );
-    let mut stream = UnixStream::connect(&path).map_err(|e| {
-        // Only ECONNREFUSED proves there is no listener. Never unlink a busy
-        // or inaccessible socket. The directory is private to this user.
-        if e.kind() == std::io::ErrorKind::ConnectionRefused {
-            let _ = fs::remove_file(&path);
-        }
-        anyhow::anyhow!("browser bridge unavailable")
-    })?;
+    // Refusal can also mean a full BSD listen backlog. Never unlink on
+    // connection failure: it is not evidence that the owning host is dead.
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|_| anyhow::anyhow!("browser bridge unavailable at {}", path.display()))?;
     verify_peer(&stream)?;
-    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.set_read_timeout(Some(ready_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let ready = read_frame(&mut stream)
         .map_err(|_| anyhow::anyhow!("browser bridge busy or unavailable; no request sent"))?;
@@ -331,6 +369,7 @@ fn connect(instance: &str) -> Result<UnixStream> {
         &*ready == br#"{"status":"ready"}"#,
         "incompatible browser host; reconnect extension"
     );
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     Ok(stream)
 }
 pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
@@ -338,7 +377,8 @@ pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
     let mut targets = Vec::new();
     let mut connected = 0;
     let mut unavailable = 0;
-    for entry in fs::read_dir(runtime_dir()?)? {
+    let dir = runtime_dir()?;
+    for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(instance) = name
@@ -348,10 +388,11 @@ pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
         else {
             continue;
         };
-        let Ok(mut stream) = connect(instance) else {
+        connected += 1;
+        let Ok(mut stream) = connect(instance, Duration::from_secs(2)) else {
+            unavailable += 1;
             continue;
         };
-        connected += 1;
         let result = (|| -> Result<Value> {
             write_frame(&mut stream, &request)?;
             sanitize_reply(&read_frame(&mut stream)?, false)
@@ -370,11 +411,13 @@ pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
     }
     ensure!(
         connected > 0,
-        "browser bridge unavailable; install host, enable extension and connect"
+        "browser bridge unavailable in {}; install host, enable extension and connect",
+        dir.display()
     );
     ensure!(
         connected > unavailable,
-        "browser discovery unavailable; reconnect extension"
+        "browser discovery unavailable in {}; host busy or disconnected",
+        dir.display()
     );
     Ok(json!({"targets":targets,"unavailable_connections":unavailable,"expires_in_seconds":60}))
 }
@@ -399,7 +442,7 @@ pub(crate) fn fill(payload: &[u8]) -> Result<Value> {
     let (instance, handle) = target
         .split_once('.')
         .ok_or_else(|| anyhow::anyhow!("invalid target"))?;
-    let mut stream = connect(instance)?; // no dispatch yet; unavailable is a definite rejection
+    let mut stream = connect(instance, Duration::from_secs(20))?; // no dispatch yet; unavailable is a definite rejection
     let request = Zeroizing::new(serde_json::to_vec(&json!({"op":"fill","handle":handle,
         "rules":v["rules"],"selector":v["selector"],"value":v["value"]}))?);
     v["value"] = Value::Null;
@@ -426,8 +469,7 @@ pub(crate) fn install(browser: &str, user_data_dir: Option<&Path>) -> Result<Val
             "supported browsers: chrome, chrome-beta, chrome-canary, chromium, chrome-for-testing"
         ),
     };
-    let home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME unavailable"))?);
+    let home = browser_home()?;
     let support = home.join("Library/Application Support");
     let extension = support.join("Latch/browser-extension");
     if let Some(dir) = user_data_dir {
@@ -487,6 +529,27 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn os_account_home_ignores_agent_home() {
+        if std::env::var_os("LATCH_HOME_TEST_CHILD").is_some() {
+            let home = account_home().unwrap();
+            assert!(home.is_absolute());
+            assert_ne!(home, PathBuf::from("/nonexistent-latch-agent-home"));
+            assert_eq!(browser_home().unwrap(), home);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser_bridge::tests::os_account_home_ignores_agent_home",
+            ])
+            .env("LATCH_HOME_TEST_CHILD", "1")
+            .env("HOME", "/nonexistent-latch-agent-home")
+            .env_remove("LATCH_BROWSER_HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
     #[test]
     fn bounded_frames_and_strict_protocol() {
         for size in [0u32, LIMIT as u32 + 1, u32::MAX] {

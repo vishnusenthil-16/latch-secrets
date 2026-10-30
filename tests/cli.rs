@@ -157,7 +157,8 @@ else: sys.exit(7)
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_latch"));
         command
-            .env("HOME", self.dir.path())
+            .env("HOME", self.dir.path().join("isolated-agent-home"))
+            .env("LATCH_BROWSER_HOME", self.dir.path())
             .arg("--state-dir")
             .arg(self.dir.path())
             .arg("--json")
@@ -1027,6 +1028,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             let before = sockets();
             let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
                 .env("HOME", home)
+                .env("LATCH_BROWSER_HOME", home)
                 .arg(format!(
                     "chrome-extension://{}/",
                     include_str!("../browser/extension-id.txt").trim()
@@ -1133,10 +1135,14 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
     fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
     drop(listener);
     let out = f.call(&["browser", "targets", "--item", ID]);
-    assert!(!stale.exists(), "discovery removes refused stale sockets");
+    assert!(
+        stale.exists(),
+        "refusal must not unlink a potentially busy host"
+    );
     public(&out);
     assert!(out.status.success(), "{out:?}");
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["unavailable_connections"], 1);
     let targets = result["targets"].as_array().unwrap();
     let a = targets
         .iter()
@@ -1165,6 +1171,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
             let out = vault
                 .command()
                 .env("HOME", f.dir.path())
+                .env("LATCH_BROWSER_HOME", f.dir.path())
                 .args([
                     "browser",
                     "fill",
@@ -1261,6 +1268,7 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
         .collect::<Vec<_>>();
     let mut stalled = Command::new(env!("CARGO_BIN_EXE_latch"))
         .env("HOME", f.dir.path())
+        .env("LATCH_BROWSER_HOME", f.dir.path())
         .arg(format!(
             "chrome-extension://{}/",
             include_str!("../browser/extension-id.txt").trim()
@@ -1331,7 +1339,8 @@ fn browser_native_host_cli_discovery_fill_and_disconnect() {
 fn browser_install_is_vault_independent_and_host_origin_is_silent() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_latch"))
-        .env("HOME", dir.path())
+        .env("HOME", dir.path().join("isolated-agent-home"))
+        .env("LATCH_BROWSER_HOME", dir.path())
         .args(["browser", "install-host", "--json"])
         .output()
         .unwrap();
@@ -1339,6 +1348,14 @@ fn browser_install_is_vault_independent_and_host_origin_is_silent() {
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     let manifest: Value =
         serde_json::from_slice(&fs::read(result["manifest"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        result["manifest"].as_str().unwrap().starts_with(
+            dir.path()
+                .join("Library/Application Support")
+                .to_str()
+                .unwrap()
+        )
+    );
     assert_eq!(manifest["path"], env!("CARGO_BIN_EXE_latch"));
     assert_eq!(manifest["allowed_origins"].as_array().unwrap().len(), 1);
     let extension = PathBuf::from(result["extension_path"].as_str().unwrap());
