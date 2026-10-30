@@ -1,4 +1,5 @@
 mod browser;
+mod browser_bridge;
 mod bw;
 mod capabilities;
 mod config;
@@ -99,13 +100,26 @@ enum Action {
 
 #[derive(Subcommand)]
 enum BrowserAction {
+    /// List permitted, policy-matching documents in connected Chrome profiles.
+    Targets {
+        #[arg(long)]
+        item: String,
+    },
+    /// Install the native host and unpacked extension (macOS; no vault access).
+    InstallHost {
+        #[arg(long, default_value = "chrome")]
+        browser: String,
+        /// Nonstandard Chrome user-data root (not its Default/Profile N subdirectory).
+        #[arg(long)]
+        user_data_dir: Option<PathBuf>,
+    },
     /// Fill one main-frame password input; never submit or retry.
     Fill {
         #[arg(long)]
         item: String,
         /// Loopback browser WebSocket endpoint, not an HTTP discovery URL.
         #[arg(long)]
-        endpoint: String,
+        endpoint: Option<String>,
         #[arg(long)]
         target: String,
         #[arg(long)]
@@ -114,6 +128,16 @@ enum BrowserAction {
 }
 
 fn main() {
+    // Chrome launches the registered executable with the extension origin, not a subcommand.
+    // Native-host failures must never go to Chrome logs or corrupt framed stdout.
+    if let Some(origin) = std::env::args()
+        .nth(1)
+        .filter(|s| s.starts_with("chrome-extension://"))
+    {
+        std::panic::set_hook(Box::new(|_| {}));
+        let ok = browser_bridge::serve(&origin).is_ok();
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     let cli = Cli::parse();
     if let Err(error) = execute(&cli) {
         // Internal boundaries deliberately discard raw bw output and secret values.
@@ -143,6 +167,20 @@ fn output(value: Value, json_output: bool) {
 fn execute(cli: &Cli) -> Result<()> {
     if matches!(cli.command, Action::Capabilities) {
         output(capabilities::manifest(), cli.json);
+        return Ok(());
+    }
+    if let Action::Browser {
+        command:
+            BrowserAction::InstallHost {
+                browser,
+                user_data_dir,
+            },
+    } = &cli.command
+    {
+        output(
+            browser_bridge::install(browser, user_data_dir.as_deref())?,
+            cli.json,
+        );
         return Ok(());
     }
     let state = config::State::new(cli.state_dir.clone())?;
@@ -335,7 +373,11 @@ fn execute(cli: &Cli) -> Result<()> {
                     selector,
                 },
         } => {
-            browser::validate(endpoint, target, selector)?;
+            if let Some(endpoint) = endpoint {
+                browser::validate(endpoint, target, selector)?;
+            } else {
+                browser_bridge::validate_target(target, selector)?;
+            }
             let id = uuid::Uuid::parse_str(item)
                 .map_err(|_| anyhow::anyhow!("item must be a UUID"))?
                 .hyphenated()
@@ -343,12 +385,44 @@ fn execute(cli: &Cli) -> Result<()> {
             let token = Zeroizing::new(session::get(&state.root)?);
             backend.call(&["sync"], Some(&token))?;
             let raw = Zeroizing::new(backend.call(&["get", "item", &id], Some(&token))?);
-            let payload = browser::payload(&raw, &id, endpoint, target, selector)?;
+            let payload = browser::payload(
+                &raw,
+                &id,
+                endpoint.as_deref().unwrap_or(""),
+                target,
+                selector,
+            )?;
             drop(raw);
             drop(token);
             drop(_guard);
-            browser::deliver(&payload)?;
-            output(json!({"status":"filled","fields":1}), cli.json);
+            if endpoint.is_some() {
+                browser::deliver(&payload)?;
+                output(json!({"status":"filled","fields":1}), cli.json);
+            } else {
+                let result = browser_bridge::fill(&payload)?;
+                let filled = result["status"] == "filled";
+                output(result, cli.json);
+                ensure!(
+                    filled,
+                    "browser fill did not confirm success; do not retry automatically"
+                );
+            }
+        }
+        Action::Browser {
+            command: BrowserAction::Targets { item },
+        } => {
+            let id = uuid::Uuid::parse_str(item)
+                .map_err(|_| anyhow::anyhow!("item must be a UUID"))?
+                .hyphenated()
+                .to_string();
+            let token = Zeroizing::new(session::get(&state.root)?);
+            backend.call(&["sync"], Some(&token))?;
+            let raw = Zeroizing::new(backend.call(&["get", "item", &id], Some(&token))?);
+            let rules = browser::rules(&raw, &id)?;
+            drop(raw);
+            drop(token);
+            drop(_guard);
+            output(browser_bridge::targets(&rules)?, cli.json);
         }
         Action::Run { bindings, .. } | Action::Write { bindings, .. } => {
             let selections = vault::parse_bindings(bindings)?;

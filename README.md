@@ -253,12 +253,22 @@ After upgrading a Homebrew installation, rerun `configure` while the existing he
 
 ## Browser password fill
 
-`latch browser fill --item ITEM_UUID --endpoint ws://127.0.0.1:9222/devtools/browser/BROWSER_ID --target CDP_TARGET_ID --selector 'input[type=password]' --json`
+Use an existing Chrome profile without a debugging port or OpenClaw dependency:
 
-Fills one main-frame password input using vault-owned HTTPS URI restrictions;
-never submits or prints the password. Requires Node.js 22.4+ and an existing
-loopback Chromium CDP session. Reprompt-protected items and unsupported destination
-policies are rejected. [Setup, policy modes, failures and security limits](browser/README.md).
+```sh
+latch browser install-host --browser chrome --json
+# Load the returned extension_path in chrome://extensions and grant site access.
+latch browser targets --item ITEM_UUID --json
+latch browser fill --item ITEM_UUID --target HANDLE --selector 'input[type=password]' --json
+```
+
+The macOS extension/native-host bridge preserves existing tabs and cookies. Targets
+are short-lived, document-bound and single-use. Existing direct CDP delivery remains
+available with `--endpoint` (requires Node.js 22.4+).
+
+Both transports use vault-owned HTTPS URI restrictions and fill only a main-frame
+password input; never submit or print the password. Reprompt-protected items and
+unsupported destination policies are rejected. [Setup, policy, failures and limits](browser/README.md).
 
 ## Security model
 

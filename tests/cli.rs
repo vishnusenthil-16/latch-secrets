@@ -998,3 +998,283 @@ sys.exit(10 if p['target']=='reject' else 11 if p['target']=='unknown' else 0)
     let calls = fs::read_to_string(f.path("calls")).unwrap();
     assert!(calls.contains("sync\nget\n"));
 }
+
+#[test]
+fn browser_native_host_cli_discovery_fill_and_disconnect() {
+    use std::os::unix::fs::MetadataExt;
+    use std::{
+        process::{Child, ChildStdin, Stdio},
+        sync::Mutex,
+    };
+    struct Host {
+        child: Child,
+        input: Arc<Mutex<Option<ChildStdin>>>,
+        worker: Option<thread::JoinHandle<()>>,
+        socket: PathBuf,
+    }
+    impl Host {
+        fn start(label: &'static str) -> Self {
+            let runtime = PathBuf::from(format!(
+                "/tmp/latch-browser-{}",
+                fs::metadata(".").unwrap().uid()
+            ));
+            let sockets = || {
+                fs::read_dir(&runtime)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .collect::<Vec<_>>()
+            };
+            let before = sockets();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
+                .arg(format!(
+                    "chrome-extension://{}/",
+                    include_str!("../browser/extension-id.txt").trim()
+                ))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = child.stdout.take().unwrap();
+            let input = Arc::new(Mutex::new(child.stdin.take()));
+            let writer = input.clone();
+            let worker = thread::spawn(move || {
+                loop {
+                    let mut header = [0; 4];
+                    if output.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let mut body = vec![0; u32::from_ne_bytes(header) as usize];
+                    output.read_exact(&mut body).unwrap();
+                    let req: Value = serde_json::from_slice(&body).unwrap();
+                    let reply = if req["op"] == "targets" {
+                        assert!(req.get("value").is_none());
+                        json!({"status":"ok","targets":[{"handle":ID,"origin":"https://example.test","title":"Login","profile":ID,"label":label,"active":true,"window":1}]})
+                    } else {
+                        assert_eq!(req["value"], SECRET);
+                        assert_eq!(req["handle"], ID);
+                        assert_eq!(req["rules"][0]["exact"], "https://example.test/login");
+                        if req["selector"] == "#disconnect" {
+                            writer.lock().unwrap().take();
+                            break;
+                        }
+                        json!({"status":if req["selector"] == "#reject" {"rejected"} else {"filled"},"value":SECRET,"error":SECRET})
+                    };
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    let mut lock = writer.lock().unwrap();
+                    let Some(input) = lock.as_mut() else {
+                        break;
+                    };
+                    input
+                        .write_all(&(bytes.len() as u32).to_ne_bytes())
+                        .unwrap();
+                    input.write_all(&bytes).unwrap();
+                    input.flush().unwrap();
+                }
+            });
+            let mut socket = None;
+            for _ in 0..100 {
+                socket = sockets().into_iter().find(|p| !before.contains(p));
+                if socket.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let socket = socket.expect("native host socket");
+            assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&runtime).unwrap().mode() & 0o777, 0o700);
+            Self {
+                child,
+                input,
+                worker: Some(worker),
+                socket,
+            }
+        }
+    }
+    impl Drop for Host {
+        fn drop(&mut self) {
+            self.input.lock().unwrap().take();
+            for _ in 0..100 {
+                if self.child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.worker.take().unwrap().join().unwrap();
+            let mut errors = String::new();
+            self.child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut errors)
+                .unwrap();
+            assert!(errors.is_empty());
+            assert!(
+                !self.socket.exists(),
+                "host must clean up socket on Chrome EOF"
+            );
+        }
+    }
+    let first = Host::start("Bridge fixture A");
+    let second = Host::start("Bridge fixture B");
+    let f = Fixture::new();
+    fs::write(f.path("item.json"),json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}}).to_string()).unwrap();
+    let out = f.call(&["browser", "targets", "--item", ID]);
+    public(&out);
+    assert!(out.status.success(), "{out:?}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let targets = result["targets"].as_array().unwrap();
+    let a = targets
+        .iter()
+        .find(|t| t["label"] == "Bridge fixture A")
+        .unwrap()["handle"]
+        .as_str()
+        .unwrap();
+    let b = targets
+        .iter()
+        .find(|t| t["label"] == "Bridge fixture B")
+        .unwrap()["handle"]
+        .as_str()
+        .unwrap();
+    assert_ne!(a, b);
+    for (target, selector, status) in [
+        (a, "#p", "filled"),
+        (b, "#reject", "rejected"),
+        (b, "#disconnect", "outcome_unknown"),
+    ] {
+        let out = f.call(&[
+            "browser",
+            "fill",
+            "--item",
+            ID,
+            "--target",
+            target,
+            "--selector",
+            selector,
+        ]);
+        public(&out);
+        assert_eq!(out.status.success(), status == "filled");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"],
+            status
+        );
+    }
+    drop(second);
+    drop(first);
+    let out = f.call(&[
+        "browser",
+        "fill",
+        "--item",
+        ID,
+        "--target",
+        a,
+        "--selector",
+        "#p",
+    ]);
+    public(&out);
+    assert!(!out.status.success());
+    // A stopped Chrome reader must not block native pipe writes forever. This
+    // payload exceeds pipe capacity; never read or print the host's stdout.
+    let runtime = PathBuf::from(format!(
+        "/tmp/latch-browser-{}",
+        fs::metadata(".").unwrap().uid()
+    ));
+    let before = fs::read_dir(&runtime)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    let mut stalled = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .arg(format!(
+            "chrome-extension://{}/",
+            include_str!("../browser/extension-id.txt").trim()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut socket = None;
+    for _ in 0..100 {
+        socket = fs::read_dir(&runtime)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| !before.contains(p));
+        if socket.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let socket = socket.unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let bytes = serde_json::to_vec(&json!({"op":"fill","handle":ID,"selector":"#p",
+        "rules":[{"origin":"https://example.test","exact":null}],"value":"X".repeat(128*1024)}))
+    .unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_ne_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).unwrap();
+    let mut reply = vec![0; u32::from_ne_bytes(header) as usize];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply).unwrap(),
+        json!({"status":"outcome_unknown"})
+    );
+    for _ in 0..100 {
+        if stalled.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exited = stalled.try_wait().unwrap().is_some();
+    if !exited {
+        let _ = stalled.kill();
+    }
+    let _ = stalled.wait();
+    assert!(exited, "native write timeout must terminate the host");
+    assert!(!socket.exists());
+}
+
+#[test]
+fn browser_install_is_vault_independent_and_host_origin_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .env("HOME", dir.path())
+        .args(["browser", "install-host", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(result["manifest"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(manifest["path"], env!("CARGO_BIN_EXE_latch"));
+    assert_eq!(manifest["allowed_origins"].as_array().unwrap().len(), 1);
+    let extension = PathBuf::from(result["extension_path"].as_str().unwrap());
+    for file in [
+        "manifest.json",
+        "worker.js",
+        "fill.js",
+        "setup.js",
+        "setup.html",
+    ] {
+        assert!(extension.join(file).is_file());
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .arg("chrome-extension://wrong/")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+}
