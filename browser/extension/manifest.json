@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Latch password bridge",
+  "version": "0.4.0",
+  "minimum_chrome_version": "106",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAur91hzV7rB/legMrUczR8W0u5yN51L9b6gWDdfXh8qmUWrnDSD7ec8i3OxgXAO1TSclK2O76EvfWpp5bG9HWZ5Kf/RnPF1wBFBxA6cuPKOgOEgNO4FC/mvVgN7UGr2R3yZXbQxz8AGcUOhW6fHEBKooOJDF6qRa7HMNPgWVhkDkA6OywtAmySLm3EUSGhEYJX8IF3IbPXk0/Dh+PH6YItST5zvJwCeZ3gfpVe8PcoO2Yw1TPGqRUyyUgxzVQtWkOAGP33nKPljo2M086mGOAWo45+3W1kknoSpFI18usbZi8wKFM8ocVCaXHwVPPg3rUObKLA9Sk9nYg4jKVFzfjxQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "scripting",
+    "webNavigation",
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "setup.html"
+  }
+}

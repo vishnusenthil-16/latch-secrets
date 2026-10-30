@@ -101,13 +101,17 @@ pub(crate) fn manifest() -> Value {
         },
         "browser_fill": {
             "command": ["latch", "browser", "fill"],
-            "required_flags": ["item", "endpoint", "target", "selector"],
-            "runtime": "Node.js 22.4+ on PATH; Chromium browser WebSocket endpoint on numeric loopback",
+            "required_flags": ["item", "target", "selector"],
+            "optional_flags": ["endpoint"],
+            "runtime": "Default: Latch Chrome extension and native host (macOS). With --endpoint: Node.js 22.4+ and loopback browser CDP",
+            "targets_command": ["latch", "browser", "targets", "--item", "ITEM_UUID", "--json"],
+            "install_command": ["latch", "browser", "install-host", "--browser", "chrome"],
+            "target_lifetime": "60 seconds; single attempt; invalidated by document navigation or host reconnection",
             "implicit_sync": true,
             "submission": false,
             "automatic_retry": false,
             "destination_policy": "vault HTTPS URIs only; explicit base-domain/host narrowed to exact origin, exact retains full URL; other modes ignored; reprompt must be 0",
-            "secret_transport": "private stdin pipe, never arguments or environment",
+            "secret_transport": "protected local socket and native messaging, or private CDP-driver stdin; never arguments or environment",
             "failure": "unknown outcome may already have filled; inspect before retrying"
         },
         "credential_delivery": {

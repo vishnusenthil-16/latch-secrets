@@ -15,7 +15,13 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parent.parent
-REQUIRED = ("Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "browser/driver.mjs", "browser/README.md", "packaging/homebrew/latch-secrets.rb.in")
+REQUIRED = (
+    "Cargo.toml", "Cargo.lock", "LICENSE", "README.md",
+    "browser/driver.mjs", "browser/README.md", "browser/extension-id.txt",
+    "browser/extension/manifest.json", "browser/extension/worker.js",
+    "browser/extension/fill.js", "browser/extension/setup.html", "browser/extension/setup.js",
+    "packaging/homebrew/latch-secrets.rb.in",
+)
 SOURCE_DIRS = ("src", "tests", "skills", "browser")
 TAG_RE = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")

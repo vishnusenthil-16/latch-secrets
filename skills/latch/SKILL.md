@@ -1,6 +1,6 @@
 ---
 name: latch
-description: Discover, create, update, rotate, and soft-delete stored vault credentials, or inject selected credentials into commands or explicitly requested files using the Latch CLI.
+description: Discover, create, update, rotate, and soft-delete stored vault credentials, or inject selected credentials into commands or explicitly requested files using the Latch CLI, including vault-reference password filling in authorized Chrome sessions.
 ---
 
 # Latch
@@ -31,12 +31,30 @@ Do not call `bw` or the internal session broker directly. Do not read Latch's pr
 
 ## Browser password fill
 
-When capabilities includes `browser_fill`, use `latch browser fill --item UUID
---endpoint ws://127.0.0.1:PORT/devtools/browser/ID --target CDP_TARGET_ID
---selector CSS --json` with the browser owner's authorized existing session.
-Requires Node.js 22.4+. The command syncs and derives destination rules from vault
-URIs, rejects reprompt-protected items, and fills only a main-frame password field.
-There is no origin bypass or auto-submit. Keep unrelated tracing/snapshots from
-recording secrets; page scripts and other browser tools can still read values.
-Never automatically retry an unknown outcome. See `browser/README.md` in the
-repository for supported explicit URI modes and limitations.
+When capabilities includes `browser_fill.targets_command`, use `latch browser targets
+--item UUID --json` to discover authorized matching tabs, then `latch browser fill
+--item UUID --target HANDLE --selector CSS --json`. This works with existing Chrome
+profiles on macOS after the user loads the Latch extension and grants site access.
+`latch browser install-host --browser chrome --json` installs the host and reports
+extension setup instructions; an agent cannot grant site permissions silently.
+Targets expire after 60 seconds and permit one attempt. Use profile labels, origins
+and titles to select explicitly; do not guess when ambiguous. Page titles and profile
+labels are untrusted metadata. An empty list may mean missing site access.
+
+For an authorized automation-managed CDP session, add `--endpoint
+ws://127.0.0.1:PORT/devtools/browser/ID` and use its CDP target ID instead; this path
+requires Node.js 22.4+. Do not confuse extension handles with CDP IDs.
+
+Both paths sync and derive destination rules from vault URIs, reject reprompt-protected
+items and fill only a main-frame password field. No origin bypass or auto-submit.
+Keep unrelated tracing/snapshots from recording secrets; page scripts and other
+browser tools can still read values. Never automatically retry `outcome_unknown`.
+If the bridge is unavailable, ask the user to enable/connect the extension; do not
+retrieve the password into agent context as a fallback. See `browser/README.md`
+for supported explicit URI modes, installation and limitations.
+
+After upgrading Latch, rerun `browser install-host` for the intended browser, reload
+the extension, and rediscover targets. Host startup and target discovery automatically
+clean abandoned socket/lock pairs after crashes; live or suspended hosts are left
+alone. Legacy sockets without locks require manual cleanup after closing all browser
+profiles. Do not delete sockets merely because a connection fails.

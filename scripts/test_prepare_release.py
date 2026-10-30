@@ -33,6 +33,11 @@ class ReleaseFixture(unittest.TestCase):
             file = self.root / rel
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text(content)
+        for rel in prepare_release.REQUIRED:
+            if rel.startswith("browser/extension"):
+                target = self.root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prepare_release.ROOT / rel, target)
         self.run_git("init", "-q")
         self.run_git("config", "user.email", "test@example.invalid")
         self.run_git("config", "user.name", "Test")
@@ -77,6 +82,9 @@ class ReleaseFixture(unittest.TestCase):
             self.assertIn("latch-secrets-0.1.0/src/main.rs", names)
             self.assertIn("latch-secrets-0.1.0/browser/driver.mjs", names)
             self.assertIn("latch-secrets-0.1.0/browser/README.md", names)
+            for rel in prepare_release.REQUIRED:
+                if rel.startswith("browser/extension"):
+                    self.assertIn("latch-secrets-0.1.0/" + rel, names)
             self.assertNotIn("latch-secrets-0.1.0/.env", names)
             self.assertNotIn("latch-secrets-0.1.0/src/.env", names)
             self.assertNotIn("latch-secrets-0.1.0/src/ignored.rs", names)

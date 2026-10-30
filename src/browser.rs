@@ -26,13 +26,7 @@ pub(crate) fn validate(endpoint: &str, target: &str, selector: &str) -> Result<(
 }
 
 // Fail closed on unsupported matching modes rather than weakening path restrictions.
-pub(crate) fn payload(
-    raw: &str,
-    id: &str,
-    endpoint: &str,
-    target: &str,
-    selector: &str,
-) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn rules(raw: &str, id: &str) -> Result<Vec<Value>> {
     let item: Value =
         serde_json::from_str(raw).map_err(|_| anyhow::anyhow!("invalid vault item"))?;
     ensure!(
@@ -73,6 +67,19 @@ pub(crate) fn payload(
         !rules.is_empty(),
         "no supported HTTPS vault URI; set an explicit host, base-domain or exact match"
     );
+    Ok(rules)
+}
+
+pub(crate) fn payload(
+    raw: &str,
+    id: &str,
+    endpoint: &str,
+    target: &str,
+    selector: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let rules = rules(raw, id)?;
+    let item: Value =
+        serde_json::from_str(raw).map_err(|_| anyhow::anyhow!("invalid vault item"))?;
     let password = item["login"]["password"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -86,11 +93,12 @@ pub(crate) fn payload(
 
 pub(crate) fn deliver(payload: &[u8]) -> Result<()> {
     let mut command = Command::new("node");
-    command.args([
-        "--input-type=module",
-        "--eval",
-        include_str!("../browser/driver.mjs"),
-    ]);
+    let driver = format!(
+        "{}\n{}",
+        include_str!("../browser/extension/fill.js").trim_start_matches("export "),
+        include_str!("../browser/driver.mjs")
+    );
+    command.args(["--input-type=module", "--eval", &driver]);
     command.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);

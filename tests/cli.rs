@@ -157,6 +157,8 @@ else: sys.exit(7)
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_latch"));
         command
+            .env("HOME", self.dir.path().join("isolated-agent-home"))
+            .env("LATCH_BROWSER_HOME", self.dir.path())
             .arg("--state-dir")
             .arg(self.dir.path())
             .arg("--json")
@@ -997,4 +999,441 @@ sys.exit(10 if p['target']=='reject' else 11 if p['target']=='unknown' else 0)
     }
     let calls = fs::read_to_string(f.path("calls")).unwrap();
     assert!(calls.contains("sync\nget\n"));
+}
+
+#[test]
+fn browser_native_host_cli_discovery_fill_and_disconnect() {
+    use std::os::unix::fs::MetadataExt;
+    use std::{
+        process::{Child, ChildStdin, Stdio},
+        sync::Mutex,
+    };
+    struct Host {
+        child: Child,
+        input: Arc<Mutex<Option<ChildStdin>>>,
+        worker: Option<thread::JoinHandle<()>>,
+        socket: PathBuf,
+    }
+    impl Host {
+        fn start(label: &'static str, home: &std::path::Path) -> Self {
+            let runtime = home.join(".latch-browser");
+            let sockets = || {
+                fs::read_dir(&runtime)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "sock"))
+                    .collect::<Vec<_>>()
+            };
+            let before = sockets();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
+                .env("HOME", home)
+                .env("LATCH_BROWSER_HOME", home)
+                .arg(format!(
+                    "chrome-extension://{}/",
+                    include_str!("../browser/extension-id.txt").trim()
+                ))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = child.stdout.take().unwrap();
+            let input = Arc::new(Mutex::new(child.stdin.take()));
+            let writer = input.clone();
+            let worker = thread::spawn(move || {
+                loop {
+                    let mut header = [0; 4];
+                    if output.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let mut body = vec![0; u32::from_ne_bytes(header) as usize];
+                    output.read_exact(&mut body).unwrap();
+                    let req: Value = serde_json::from_slice(&body).unwrap();
+                    let reply = if req["op"] == "targets" {
+                        assert!(req.get("value").is_none());
+                        json!({"status":"ok","targets":[{"handle":ID,"origin":"https://example.test","title":"Login","profile":ID,"label":label,"active":true,"window":1}]})
+                    } else {
+                        assert_eq!(req["value"], SECRET);
+                        assert_eq!(req["handle"], ID);
+                        assert_eq!(req["rules"][0]["exact"], "https://example.test/login");
+                        if req["selector"] == "#slow" {
+                            thread::sleep(Duration::from_secs(11));
+                        }
+                        if req["selector"] == "#no-reply" {
+                            continue; // Chrome consumed the payload but never answers.
+                        }
+                        if req["selector"] == "#disconnect" {
+                            writer.lock().unwrap().take();
+                            break;
+                        }
+                        json!({"status":if req["selector"] == "#reject" {"rejected"} else {"filled"},"value":SECRET,"error":SECRET})
+                    };
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    let mut lock = writer.lock().unwrap();
+                    let Some(input) = lock.as_mut() else {
+                        break;
+                    };
+                    input
+                        .write_all(&(bytes.len() as u32).to_ne_bytes())
+                        .unwrap();
+                    input.write_all(&bytes).unwrap();
+                    input.flush().unwrap();
+                }
+            });
+            let mut socket = None;
+            for _ in 0..100 {
+                socket = sockets()
+                    .into_iter()
+                    .find(|p| p.extension().is_some_and(|e| e == "sock") && !before.contains(p));
+                if socket.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let socket = socket.expect("native host socket");
+            assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&runtime).unwrap().mode() & 0o777, 0o700);
+            Self {
+                child,
+                input,
+                worker: Some(worker),
+                socket,
+            }
+        }
+    }
+    impl Drop for Host {
+        fn drop(&mut self) {
+            self.input.lock().unwrap().take();
+            for _ in 0..100 {
+                if self.child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.worker.take().unwrap().join().unwrap();
+            let mut errors = String::new();
+            self.child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut errors)
+                .unwrap();
+            assert!(errors.is_empty());
+            assert!(
+                !self.socket.exists(),
+                "host must clean up socket on Chrome EOF"
+            );
+        }
+    }
+    let f = Fixture::new();
+    let first = Host::start("Bridge fixture A", f.dir.path());
+    let second = Host::start("Bridge fixture B", f.dir.path());
+    fs::write(f.path("item.json"),json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}}).to_string()).unwrap();
+    let stale = f.path(".latch-browser/11111111111111111111111111111111.sock");
+    let listener = UnixListener::bind(&stale).unwrap();
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(listener);
+    let out = f.call(&["browser", "targets", "--item", ID]);
+    assert!(
+        stale.exists(),
+        "refusal must not unlink a potentially busy host"
+    );
+    public(&out);
+    assert!(out.status.success(), "{out:?}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["unavailable_connections"], 1);
+    let targets = result["targets"].as_array().unwrap();
+    let a = targets
+        .iter()
+        .find(|t| t["label"] == "Bridge fixture A")
+        .unwrap()["handle"]
+        .as_str()
+        .unwrap();
+    let b = targets
+        .iter()
+        .find(|t| t["label"] == "Bridge fixture B")
+        .unwrap()["handle"]
+        .as_str()
+        .unwrap();
+    assert_ne!(a, b);
+    assert_eq!(
+        targets.len(),
+        2,
+        "only isolated fixture hosts are discovered"
+    );
+    // Two 11-second fills exceed the old 20-second client timeout when
+    // serialized. The second client now waits before sending its payload.
+    let other_vault = Fixture::new();
+    fs::copy(f.path("item.json"), other_vault.path("item.json")).unwrap();
+    thread::scope(|scope| {
+        let run = |vault: &Fixture| {
+            let out = vault
+                .command()
+                .env("HOME", f.dir.path())
+                .env("LATCH_BROWSER_HOME", f.dir.path())
+                .args([
+                    "browser",
+                    "fill",
+                    "--item",
+                    ID,
+                    "--target",
+                    a,
+                    "--selector",
+                    "#slow",
+                ])
+                .output()
+                .unwrap();
+            public(&out);
+            assert!(out.status.success(), "{out:?}");
+        };
+        let f_ref = &f;
+        let other_ref = &other_vault;
+        let first = scope.spawn(move || run(f_ref));
+        let second = scope.spawn(move || run(other_ref));
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+    // A caller that abandons the ready queue sends no payload and cannot
+    // produce a later native request. Block accept briefly with an idle peer.
+    let mut idle = std::os::unix::net::UnixStream::connect(&first.socket).unwrap();
+    let mut header = [0; 4];
+    idle.read_exact(&mut header).unwrap();
+    let mut ready = vec![0; u32::from_ne_bytes(header) as usize];
+    idle.read_exact(&mut ready).unwrap();
+    let mut abandoned = std::os::unix::net::UnixStream::connect(&first.socket).unwrap();
+    abandoned
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert!(abandoned.read(&mut [0; 1]).is_err());
+    drop(abandoned);
+    drop(idle);
+    for (target, selector, status) in [
+        (a, "#p", "filled"),
+        (b, "#reject", "rejected"),
+        (b, "#disconnect", "outcome_unknown"),
+    ] {
+        let out = f.call(&[
+            "browser",
+            "fill",
+            "--item",
+            ID,
+            "--target",
+            target,
+            "--selector",
+            selector,
+        ]);
+        public(&out);
+        assert_eq!(out.status.success(), status == "filled", "{out:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"],
+            status
+        );
+    }
+    let out = f.call(&[
+        "browser",
+        "fill",
+        "--item",
+        ID,
+        "--target",
+        a,
+        "--selector",
+        "#no-reply",
+    ]);
+    public(&out);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"],
+        "outcome_unknown"
+    );
+    drop(second);
+    drop(first);
+    let out = f.call(&[
+        "browser",
+        "fill",
+        "--item",
+        ID,
+        "--target",
+        a,
+        "--selector",
+        "#p",
+    ]);
+    public(&out);
+    assert!(!out.status.success());
+    // A stopped Chrome reader must not block native pipe writes forever. This
+    // payload exceeds pipe capacity; never read or print the host's stdout.
+    let runtime = f.path(".latch-browser");
+    let before = fs::read_dir(&runtime)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    let mut stalled = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .env("HOME", f.dir.path())
+        .env("LATCH_BROWSER_HOME", f.dir.path())
+        .arg(format!(
+            "chrome-extension://{}/",
+            include_str!("../browser/extension-id.txt").trim()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut socket = None;
+    for _ in 0..100 {
+        socket = fs::read_dir(&runtime)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "sock") && !before.contains(p));
+        if socket.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let socket = socket.unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut ready_header = [0; 4];
+    stream.read_exact(&mut ready_header).unwrap();
+    let mut ready = vec![0; u32::from_ne_bytes(ready_header) as usize];
+    stream.read_exact(&mut ready).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ready).unwrap(),
+        json!({"status":"ready"})
+    );
+    let bytes = serde_json::to_vec(&json!({"op":"fill","handle":ID,"selector":"#p",
+        "rules":[{"origin":"https://example.test","exact":null}],"value":"X".repeat(128*1024)}))
+    .unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_ne_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).unwrap();
+    let mut reply = vec![0; u32::from_ne_bytes(header) as usize];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply).unwrap(),
+        json!({"status":"outcome_unknown"})
+    );
+    for _ in 0..100 {
+        if stalled.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exited = stalled.try_wait().unwrap().is_some();
+    if !exited {
+        let _ = stalled.kill();
+    }
+    let _ = stalled.wait();
+    assert!(exited, "native write timeout must terminate the host");
+    assert!(!socket.exists());
+}
+
+#[test]
+fn browser_install_is_vault_independent_and_host_origin_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .env("HOME", dir.path().join("isolated-agent-home"))
+        .env("LATCH_BROWSER_HOME", dir.path())
+        .args(["browser", "install-host", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(result["manifest"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        result["manifest"].as_str().unwrap().starts_with(
+            dir.path()
+                .join("Library/Application Support")
+                .to_str()
+                .unwrap()
+        )
+    );
+    assert_eq!(manifest["path"], env!("CARGO_BIN_EXE_latch"));
+    assert_eq!(manifest["allowed_origins"].as_array().unwrap().len(), 1);
+    let extension = PathBuf::from(result["extension_path"].as_str().unwrap());
+    for file in [
+        "manifest.json",
+        "worker.js",
+        "fill.js",
+        "setup.js",
+        "setup.html",
+    ] {
+        assert!(extension.join(file).is_file());
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .arg("chrome-extension://wrong/")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn browser_crash_cleanup_and_suspended_host() {
+    use std::process::Stdio;
+    let f = Fixture::new();
+    fs::write(f.path("item.json"),json!({"id":ID,"type":1,"reprompt":0,"login":{"password":SECRET,"uris":[{"uri":"https://example.test/login","match":3}]}}).to_string()).unwrap();
+    let runtime = f.path(".latch-browser");
+    for signal in [libc::SIGKILL, libc::SIGTERM, 0] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_latch"))
+            .env("LATCH_BROWSER_HOME", f.dir.path())
+            .arg(format!(
+                "chrome-extension://{}/",
+                include_str!("../browser/extension-id.txt").trim()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let socket = (0..200)
+            .find_map(|_| {
+                let socket = fs::read_dir(&runtime).ok().and_then(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().is_some_and(|e| e == "sock"))
+                });
+                if socket.is_none() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                socket
+            })
+            .expect("host starts");
+        let lock = socket.with_extension("lock");
+        assert!(lock.exists());
+        if signal == libc::SIGKILL {
+            // SAFETY: signal our own live child. A stopped host remains locked.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) }, 0);
+            let out = f.call(&["browser", "targets", "--item", ID, "--json"]);
+            assert!(!out.status.success());
+            assert!(lock.exists() && socket.exists());
+        }
+        if signal == 0 {
+            drop(child.stdin.take());
+        } else {
+            // SAFETY: signal our own live child.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        }
+        child.wait().unwrap();
+        if signal != 0 {
+            assert!(lock.exists() && socket.exists());
+        }
+        let out = f.call(&["browser", "targets", "--item", ID, "--json"]);
+        assert!(!out.status.success());
+        assert!(!socket.exists() && !lock.exists());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("browser bridge unavailable"));
+    }
 }

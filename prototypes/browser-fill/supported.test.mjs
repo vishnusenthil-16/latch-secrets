@@ -5,8 +5,9 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {chromium} from 'playwright';
-const driver = await readFile(new URL('../../browser/driver.mjs',import.meta.url),'utf8');
-const source = driver.slice(driver.indexOf('function fillDocument'),driver.indexOf('\nconst deadline'));
+const source = (await readFile(new URL('../../browser/extension/fill.js',import.meta.url),'utf8')).replace(/^export /, '');
+const driver = source + await readFile(new URL('../../browser/driver.mjs',import.meta.url),'utf8');
+
 const rules = [{origin:'https://fixture.test',exact:null}];
 const run = payload => new Promise((resolve,reject)=>{
  const child=spawn(process.execPath,['--input-type=module','--eval',driver],{env:{PATH:process.env.PATH}});
