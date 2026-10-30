@@ -251,6 +251,15 @@ An inaccessible Keychain or missing desktop session prevents unattended access. 
 
 After upgrading a Homebrew installation, rerun `configure` while the existing helper is still running. It transfers a readable session through memory to the new helper. If the existing helper is unavailable or its Keychain cannot be read, configuration stops with recovery guidance. See the [upgrade notes](packaging/homebrew/README.md#runtime-dependency-and-upgrades) for the stable executable path and recovery procedure.
 
+## Browser password fill
+
+`latch browser fill --item ITEM_UUID --endpoint ws://127.0.0.1:9222/devtools/browser/BROWSER_ID --target CDP_TARGET_ID --selector 'input[type=password]' --json`
+
+Fills one main-frame password input using vault-owned HTTPS URI restrictions;
+never submits or prints the password. Requires Node.js 22.4+ and an existing
+loopback Chromium CDP session. Reprompt-protected items and unsupported destination
+policies are rejected. [Setup, policy modes, failures and security limits](browser/README.md).
+
 ## Security model
 
 Bitwarden handles cryptography, authentication, encrypted vault storage, and server communication. Latch stores only the session in the login Keychain; it does not persist the master password or personal API credentials.

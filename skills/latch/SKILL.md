@@ -28,3 +28,15 @@ When authorized, use `latch delete ITEM_UUID --json` to move the exact item to v
 Never print credentials with `env`, `printenv`, shell tracing, or a diagnostic child command. Never place secret values directly in arguments, task messages, source code, or generated documentation. A target process can leak its own environment; choose commands appropriate to the requested task.
 
 Do not call `bw` or the internal session broker directly. Do not read Latch's private state. Use `latch --help` for supported flags. No automatic account creation, infrastructure changes, or publishing is part of this skill.
+
+## Browser password fill
+
+When capabilities includes `browser_fill`, use `latch browser fill --item UUID
+--endpoint ws://127.0.0.1:PORT/devtools/browser/ID --target CDP_TARGET_ID
+--selector CSS --json` with the browser owner's authorized existing session.
+Requires Node.js 22.4+. The command syncs and derives destination rules from vault
+URIs, rejects reprompt-protected items, and fills only a main-frame password field.
+There is no origin bypass or auto-submit. Keep unrelated tracing/snapshots from
+recording secrets; page scripts and other browser tools can still read values.
+Never automatically retry an unknown outcome. See `browser/README.md` in the
+repository for supported explicit URI modes and limitations.
