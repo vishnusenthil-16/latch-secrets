@@ -68,6 +68,8 @@ if args[0] in ('create', 'edit'):
     import base64
     assert args == (['create', 'item', '--nointeraction'] if args[0] == 'create' else ['edit', 'item', item['id'], '--nointeraction'])
     payload = json.loads(base64.b64decode(sys.stdin.read()))
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     payload['id'] = '00000000-0000-4000-8000-000000000001'
@@ -80,6 +82,8 @@ if args[0] == 'move':
     assert args == ['move', item['id'], '00000000-0000-4000-8000-000000000002', '--nointeraction']
     collections = json.loads(base64.b64decode(sys.stdin.read()))
     assert item.get('organizationId') is None
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     item['organizationId'] = args[2]
@@ -92,6 +96,8 @@ if args[0] == 'move':
 if args[0] == 'delete':
     assert args == ['delete', 'item', item['id'], '--nointeraction']
     assert item.get('deletedDate') is None
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     item['deletedDate'] = '2026-09-28T00:00:00Z'
@@ -1656,6 +1662,21 @@ fn assert_transfer_uncertain(f: &Fixture) {
 }
 
 #[test]
+fn transfer_reports_safe_backend_category_without_retry() {
+    let f = Fixture::new();
+    fs::write(f.path("permission-fail"), "").unwrap();
+    let out = f.call(&transfer_args());
+    public(&out);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("outcome uncertain"));
+    assert!(error.contains("code 1: collection_permission_denied"));
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\nmove\n"
+    );
+}
+
+#[test]
 fn transfer_reuses_dependency_session_and_lock_guards() {
     for failure in ["bad-version", "session", "lock"] {
         let f = Fixture::new();
@@ -1675,5 +1696,41 @@ fn transfer_reuses_dependency_session_and_lock_guards() {
                 .lines()
                 .any(|c| matches!(c, "sync" | "get" | "move"))
         );
+    }
+}
+
+#[test]
+fn mutation_categories_are_safe_json_errors_without_retries() {
+    for operation in ["create", "update", "delete"] {
+        let f = Fixture::new();
+        fs::write(f.path("permission-fail"), "").unwrap();
+        let out = match operation {
+            "create" => f.input(
+                &["create"],
+                r#"{"name":"service","login":{"password":"CANARY"}}"#,
+            ),
+            "update" => f.input(&["update", ID], r#"{"login":{"password":"CANARY"}}"#),
+            _ => f.call(&["delete", ID]),
+        };
+        assert!(!out.status.success());
+        public(&out);
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+        let error = error["error"]["message"].as_str().unwrap();
+        assert!(error.contains("outcome uncertain"));
+        assert!(error.contains("code 1: collection_permission_denied"));
+        let verb = if operation == "update" {
+            "edit"
+        } else {
+            operation
+        };
+        assert_eq!(
+            fs::read_to_string(f.path("calls"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == verb)
+                .count(),
+            1
+        );
+        assert!(!f.path("item.json").exists());
     }
 }
