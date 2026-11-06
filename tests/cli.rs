@@ -62,7 +62,7 @@ if args[0] == 'status':
 if args[0] == 'lock':
     (root/'locked').touch(); sys.exit(0)
 assert os.environ.get('BW_SESSION') == 'SYNTHETIC_SESSION'
-item = {'id':'00000000-0000-4000-8000-000000000001','name':'test-service','type':1,'organizationId':None,'collectionIds':[], 'notes':'CANARY_NOTES','login':{'username':'user','password':"CANARY_latch_$(not executed)'\"\\end"}, 'fields':[{'name':'token','type':1,'value':'CANARY_CUSTOM'}]}
+item = {'id':'00000000-0000-4000-8000-000000000001','name':'test-service','type':1,'collectionIds':[], 'notes':'CANARY_NOTES','login':{'username':'user','password':"CANARY_latch_$(not executed)'\"\\end"}, 'fields':[{'name':'token','type':1,'value':'CANARY_CUSTOM'}]}
 if (root/'item.json').exists(): item = json.loads((root/'item.json').read_text())
 if args[0] in ('create', 'edit'):
     import base64
@@ -1551,11 +1551,59 @@ fn transfer_rejects_invalid_ids_duplicates_and_missing_collections_before_sync()
 }
 
 #[test]
+fn transfer_accepts_missing_or_null_personal_item_metadata() {
+    for item in [
+        json!({"id":ID}),
+        json!({"id":ID,"organizationId":null,"deletedDate":null,"archivedDate":null}),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.path("item.json"), item.to_string()).unwrap();
+        let out = f.call(&transfer_args());
+        assert!(out.status.success(), "{:?}", out);
+        public(&out);
+    }
+}
+
+#[test]
+fn transfer_normalizes_ids_before_backend_calls() {
+    let f = Fixture::new();
+    let out = f.call(&[
+        "transfer",
+        "00000000000040008000000000000001",
+        "--organization",
+        "00000000000040008000000000000002",
+        "--collection",
+        "{ABCDEFAB-CDEF-4000-8000-ABCDEFABCDEF}",
+    ]);
+    assert!(out.status.success(), "{:?}", out);
+    public(&out);
+    let item: Value = serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    assert_eq!(
+        item["collectionIds"],
+        json!(["abcdefab-cdef-4000-8000-abcdefabcdef"])
+    );
+}
+
+#[test]
+fn transfer_accepts_reordered_response_collections() {
+    let f = Fixture::new();
+    fs::write(
+        f.path("transfer-response.json"),
+        json!({"id":ID,"organizationId":ORG,"collectionIds":[COLLECTION_2,COLLECTION]}).to_string(),
+    )
+    .unwrap();
+    let mut args = transfer_args();
+    args.extend(["--collection", COLLECTION_2]);
+    let out = f.call(&args);
+    assert!(out.status.success(), "{:?}", out);
+    public(&out);
+}
+
+#[test]
 fn transfer_rejects_wrong_deleted_archived_and_owned_items() {
     for item in [
         json!(null),
         json!({"id":"CANARY_WRONG","organizationId":null}),
-        json!({"id":ID}),
         json!({"id":ID,"organizationId":ORG}),
         json!({"id":ID,"organizationId":null,"deletedDate":"date"}),
         json!({"id":ID,"organizationId":null,"archivedDate":"date"}),

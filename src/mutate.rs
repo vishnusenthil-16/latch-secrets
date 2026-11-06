@@ -286,7 +286,7 @@ pub(crate) fn transfer(
         "bw returned a different item than requested"
     );
     ensure!(
-        item.get("organizationId") == Some(&Value::Null),
+        item.is_object() && item["organizationId"].is_null(),
         "only personal items can be transferred; organization-owned items cannot be moved back or between organizations"
     );
     ensure!(
