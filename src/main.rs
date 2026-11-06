@@ -69,6 +69,16 @@ enum Action {
     Update { item_uuid: String },
     /// Move an item by UUID to vault trash; permanent deletion is never supported.
     Delete { item_uuid: String },
+    /// Transfer a personal item to an organization; cannot be moved back.
+    Transfer {
+        item_uuid: String,
+        /// Destination organization UUID.
+        #[arg(long)]
+        organization: String,
+        /// Destination collection UUID; repeat for multiple collections.
+        #[arg(long = "collection", required = true)]
+        collections: Vec<String>,
+    },
     /// Inject selected fields into a child; no implicit shell or synchronization.
     Run {
         #[arg(long = "env", required = true)]
@@ -363,6 +373,17 @@ fn execute(cli: &Cli) -> Result<()> {
         Action::Delete { item_uuid } => {
             let token = Zeroizing::new(session::get(&state.root)?);
             output(mutate::delete(&backend, &token, item_uuid)?, cli.json);
+        }
+        Action::Transfer {
+            item_uuid,
+            organization,
+            collections,
+        } => {
+            let token = Zeroizing::new(session::get(&state.root)?);
+            output(
+                mutate::transfer(&backend, &token, item_uuid, organization, collections)?,
+                cli.json,
+            );
         }
         Action::Browser {
             command:
