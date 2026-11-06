@@ -34,7 +34,7 @@ pub(crate) fn manifest() -> Value {
                 "arguments": arguments,
                 "help_command": ["latch", name, "--help"],
                 "requires_interactive_terminal": name == "login",
-                "requires_stored_session": matches!(name, "browser" | "sync" | "list" | "run" | "write" | "create" | "update" | "delete"),
+                "requires_stored_session": matches!(name, "browser" | "sync" | "list" | "run" | "write" | "create" | "update" | "delete" | "transfer"),
             })
         })
         .collect();
@@ -85,6 +85,18 @@ pub(crate) fn manifest() -> Value {
             "rotation": "updates stored vault values only; does not issue or revoke provider credentials or refresh previously written files",
             "success_fields": ["id", "created", "updated"],
             "agent_instruction": "Never place secrets in argv, chat, shell history, tracing, or output. Feed stdin from a trusted secret source."
+        },
+        "ownership_transfer": {
+            "command": ["latch", "transfer", "ITEM_UUID", "--organization", "ORG_UUID", "--collection", "COLLECTION_UUID"],
+            "identifiers": "UUIDs only; at least one collection; repeat --collection for multiple unique collections",
+            "semantics": "personal item to organization only; deleted, archived and organization-owned items are refused; cannot transfer back, between organizations or to another user",
+            "permissions": "backend enforces destination organization membership and collection edit permissions",
+            "backend_transport": "native bw move with base64 collection IDs through stdin; never copy/delete or edit organizationId",
+            "implicit_sync": true,
+            "automatic_retry": false,
+            "concurrency": "exclusive local state lock; sync and exact-target validation before move; not atomic across clients",
+            "failure": "a transfer error can have an uncertain outcome; inspect vault before retrying",
+            "success_fields": ["id", "transferred", "organizationId", "collectionIds"]
         },
         "deletion": {
             "command": ["latch", "delete", "ITEM_UUID"],

@@ -47,6 +47,7 @@ fn discovery_needs_no_home_backend_or_state_and_is_read_only() {
             "create",
             "update",
             "delete",
+            "transfer",
             "run",
             "browser",
             "write",
@@ -102,4 +103,30 @@ fn delete_contract_is_soft_only() {
             .iter()
             .all(|a| a["long"] != "permanent")
     );
+}
+
+#[test]
+fn transfer_contract_is_discoverable() {
+    let output = Command::new(env!("CARGO_BIN_EXE_latch"))
+        .args(["capabilities", "--json"])
+        .output()
+        .unwrap();
+    let m: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(m["ownership_transfer"]["automatic_retry"], false);
+    assert_eq!(m["ownership_transfer"]["implicit_sync"], true);
+    let command = m["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "transfer")
+        .unwrap();
+    assert_eq!(command["requires_stored_session"], true);
+    let collection = command["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["long"] == "collection")
+        .unwrap();
+    assert_eq!(collection["required"], true);
+    assert_eq!(collection["repeatable"], true);
 }

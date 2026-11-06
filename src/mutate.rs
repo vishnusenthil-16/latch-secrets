@@ -244,6 +244,82 @@ pub(crate) fn delete(backend: &Bw<'_>, token: &str, id: &str) -> Result<Value> {
     Ok(json!({"id":id,"deleted":true,"permanent":false}))
 }
 
+/// Move a personal item using bw's re-encryption/share operation, never an edit
+/// of organizationId. The backend enforces organization/collection permissions.
+pub(crate) fn transfer(
+    backend: &Bw<'_>,
+    token: &str,
+    id: &str,
+    organization: &str,
+    collections: &[String],
+) -> Result<Value> {
+    fn identifier(value: &str) -> Result<String> {
+        uuid::Uuid::parse_str(value)
+            .map(|id| id.hyphenated().to_string())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "transfer item, organization and collection identifiers must be UUIDs"
+                )
+            })
+    }
+    let id = identifier(id)?;
+    let organization = identifier(organization)?;
+    let collections = collections
+        .iter()
+        .map(|id| identifier(id))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !collections.is_empty(),
+        "transfer requires at least one collection"
+    );
+    let selected: HashSet<_> = collections.iter().collect();
+    ensure!(
+        selected.len() == collections.len(),
+        "duplicate transfer collection identifier"
+    );
+    backend.call(&["sync"], Some(token))?;
+    let raw = Zeroizing::new(backend.call(&["get", "item", &id], Some(token))?);
+    let item: Value =
+        serde_json::from_str(&raw).map_err(|_| anyhow::anyhow!("bw returned invalid item data"))?;
+    ensure!(
+        item["id"] == id,
+        "bw returned a different item than requested"
+    );
+    ensure!(
+        item.is_object() && item["organizationId"].is_null(),
+        "only personal items can be transferred; organization-owned items cannot be moved back or between organizations"
+    );
+    ensure!(
+        item["deletedDate"].is_null() && item["archivedDate"].is_null(),
+        "deleted or archived items cannot be transferred"
+    );
+    // Pinned cli-v2026.8.0 admin-console/commands/share.command.ts reads
+    // base64 collection IDs from stdin and checks canEditItems for every one.
+    let encoded = Zeroizing::new(base64(serde_json::to_string(&collections)?.as_bytes()));
+    let response = Zeroizing::new(backend.mutate(&["move", &id, &organization], token, encoded)?);
+    let uncertain = "transfer outcome uncertain: invalid destination or item in backend response; inspect vault before retrying";
+    let result: Value = serde_json::from_str(&response).map_err(|_| anyhow::anyhow!(uncertain))?;
+    ensure!(
+        result["id"] == id && result["organizationId"] == organization,
+        uncertain
+    );
+    let returned = result["collectionIds"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!(uncertain))?;
+    ensure!(
+        returned.len() == selected.len()
+            && returned
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>()
+                == selected.iter().map(|id| id.as_str()).collect(),
+        uncertain
+    );
+    Ok(
+        json!({"id":id,"transferred":true,"organizationId":organization,"collectionIds":collections}),
+    )
+}
+
 // Standard RFC 4648 base64, kept local to avoid an extra dependency for one encoder.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

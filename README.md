@@ -126,6 +126,31 @@ Latch executes the command directly, without an implicit shell. It inherits ordi
 
 `list`, `run`, and `write` read the last synchronized local vault. Run `latch sync` when you need current server data; synchronization and retries are explicit.
 
+### Transfer ownership
+
+Move a personal vault item into an organization and one or more collections:
+
+```sh
+latch transfer ITEM_UUID --organization ORG_UUID --collection COLLECTION_UUID --json
+# Repeat --collection COLLECTION_UUID for additional destination collections.
+```
+
+Use `latch list --json` to identify the item; obtain destination organization and
+collection UUIDs from your vault client. All identifiers must be UUIDs, with at
+least one unique collection. The destination must permit you to add items.
+
+This uses Bitwarden's native `move` operation to re-encrypt the item for the
+organization, not a copy/delete or metadata edit. It supports personal items only,
+not transfers to another user, back to personal ownership, or between organizations.
+Deleted and archived items are refused. **The organization becomes the owner;
+collection access controls determine who can access the item.**
+
+Latch syncs and checks the exact item first, then makes one transfer attempt under
+the local state lock. Avoid concurrent edits in other clients. Success returns only
+`{id,transferred:true,organizationId,collectionIds}` after validating the returned
+destination. Backend failures or invalid responses can have an uncertain outcome;
+inspect the vault before retrying. No credentials are printed or rotated.
+
 ### Create or update secrets
 
 `latch create` creates a personal login item. `latch update ITEM_UUID` patches an existing login item, including rotating its stored password or custom fields. Both accept strict JSON through piped or redirected stdin (maximum 1 MiB), never secret command-line arguments. Have your credential-producing process serialize JSON directly into the pipe; do not paste real secrets into shell history.

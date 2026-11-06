@@ -62,7 +62,7 @@ if args[0] == 'status':
 if args[0] == 'lock':
     (root/'locked').touch(); sys.exit(0)
 assert os.environ.get('BW_SESSION') == 'SYNTHETIC_SESSION'
-item = {'id':'00000000-0000-4000-8000-000000000001','name':'test-service','type':1,'organizationId':None,'collectionIds':[], 'notes':'CANARY_NOTES','login':{'username':'user','password':"CANARY_latch_$(not executed)'\"\\end"}, 'fields':[{'name':'token','type':1,'value':'CANARY_CUSTOM'}]}
+item = {'id':'00000000-0000-4000-8000-000000000001','name':'test-service','type':1,'collectionIds':[], 'notes':'CANARY_NOTES','login':{'username':'user','password':"CANARY_latch_$(not executed)'\"\\end"}, 'fields':[{'name':'token','type':1,'value':'CANARY_CUSTOM'}]}
 if (root/'item.json').exists(): item = json.loads((root/'item.json').read_text())
 if args[0] in ('create', 'edit'):
     import base64
@@ -74,6 +74,20 @@ if args[0] in ('create', 'edit'):
     (root/'item.json').write_text(json.dumps(payload))
     if (root/'bad-response').exists(): print('CANARY_invalid_response')
     else: print(json.dumps(payload))
+    sys.exit(0)
+if args[0] == 'move':
+    import base64
+    assert args == ['move', item['id'], '00000000-0000-4000-8000-000000000002', '--nointeraction']
+    collections = json.loads(base64.b64decode(sys.stdin.read()))
+    assert item.get('organizationId') is None
+    if (root/'mutation-fail').exists():
+        print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
+    item['organizationId'] = args[2]
+    item['collectionIds'] = collections
+    (root/'item.json').write_text(json.dumps(item))
+    if (root/'bad-response').exists(): print('CANARY_invalid_response')
+    elif (root/'transfer-response.json').exists(): print((root/'transfer-response.json').read_text())
+    else: print(json.dumps(item))
     sys.exit(0)
 if args[0] == 'delete':
     assert args == ['delete', 'item', item['id'], '--nointeraction']
@@ -1435,5 +1449,231 @@ fn browser_crash_cleanup_and_suspended_host() {
         assert!(!out.status.success());
         assert!(!socket.exists() && !lock.exists());
         assert!(String::from_utf8_lossy(&out.stderr).contains("browser bridge unavailable"));
+    }
+}
+
+const ORG: &str = "00000000-0000-4000-8000-000000000002";
+const COLLECTION: &str = "00000000-0000-4000-8000-000000000003";
+const COLLECTION_2: &str = "00000000-0000-4000-8000-000000000004";
+
+fn transfer_args() -> Vec<&'static str> {
+    vec![
+        "transfer",
+        ID,
+        "--organization",
+        ORG,
+        "--collection",
+        COLLECTION,
+    ]
+}
+
+#[test]
+fn transfer_preserves_item_and_returns_only_verified_metadata() {
+    let f = Fixture::new();
+    let mut args = transfer_args();
+    args.extend(["--collection", COLLECTION_2]);
+    let out = f.call(&args);
+    assert!(out.status.success(), "{:?}", out);
+    public(&out);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"id":ID,"transferred":true,"organizationId":ORG,"collectionIds":[COLLECTION,COLLECTION_2]})
+    );
+    let item: Value = serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    assert_eq!(item["login"]["password"], SECRET);
+    assert_eq!(item["notes"], "CANARY_NOTES");
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\nmove\n"
+    );
+    let again = f.call(&args);
+    assert!(!again.status.success());
+    public(&again);
+    assert_eq!(
+        fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .lines()
+            .filter(|s| *s == "move")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn transfer_rejects_invalid_ids_duplicates_and_missing_collections_before_sync() {
+    for args in [
+        vec![
+            "transfer",
+            "CANARY",
+            "--organization",
+            ORG,
+            "--collection",
+            COLLECTION,
+        ],
+        vec![
+            "transfer",
+            ID,
+            "--organization",
+            "CANARY",
+            "--collection",
+            COLLECTION,
+        ],
+        vec![
+            "transfer",
+            ID,
+            "--organization",
+            ORG,
+            "--collection",
+            "CANARY",
+        ],
+        vec![
+            "transfer",
+            ID,
+            "--organization",
+            ORG,
+            "--collection",
+            COLLECTION,
+            "--collection",
+            COLLECTION,
+        ],
+        vec!["transfer", ID, "--organization", ORG],
+    ] {
+        let f = Fixture::new();
+        let out = f.call(&args);
+        assert!(!out.status.success());
+        public(&out);
+        assert!(
+            !fs::read_to_string(f.path("calls"))
+                .unwrap_or_default()
+                .contains("sync")
+        );
+    }
+}
+
+#[test]
+fn transfer_accepts_missing_or_null_personal_item_metadata() {
+    for item in [
+        json!({"id":ID}),
+        json!({"id":ID,"organizationId":null,"deletedDate":null,"archivedDate":null}),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.path("item.json"), item.to_string()).unwrap();
+        let out = f.call(&transfer_args());
+        assert!(out.status.success(), "{:?}", out);
+        public(&out);
+    }
+}
+
+#[test]
+fn transfer_normalizes_ids_before_backend_calls() {
+    let f = Fixture::new();
+    let out = f.call(&[
+        "transfer",
+        "00000000000040008000000000000001",
+        "--organization",
+        "00000000000040008000000000000002",
+        "--collection",
+        "{ABCDEFAB-CDEF-4000-8000-ABCDEFABCDEF}",
+    ]);
+    assert!(out.status.success(), "{:?}", out);
+    public(&out);
+    let item: Value = serde_json::from_slice(&fs::read(f.path("item.json")).unwrap()).unwrap();
+    assert_eq!(
+        item["collectionIds"],
+        json!(["abcdefab-cdef-4000-8000-abcdefabcdef"])
+    );
+}
+
+#[test]
+fn transfer_accepts_reordered_response_collections() {
+    let f = Fixture::new();
+    fs::write(
+        f.path("transfer-response.json"),
+        json!({"id":ID,"organizationId":ORG,"collectionIds":[COLLECTION_2,COLLECTION]}).to_string(),
+    )
+    .unwrap();
+    let mut args = transfer_args();
+    args.extend(["--collection", COLLECTION_2]);
+    let out = f.call(&args);
+    assert!(out.status.success(), "{:?}", out);
+    public(&out);
+}
+
+#[test]
+fn transfer_rejects_wrong_deleted_archived_and_owned_items() {
+    for item in [
+        json!(null),
+        json!({"id":"CANARY_WRONG","organizationId":null}),
+        json!({"id":ID,"organizationId":ORG}),
+        json!({"id":ID,"organizationId":null,"deletedDate":"date"}),
+        json!({"id":ID,"organizationId":null,"archivedDate":"date"}),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.path("item.json"), item.to_string()).unwrap();
+        let out = f.call(&transfer_args());
+        assert!(!out.status.success());
+        public(&out);
+        assert!(
+            !fs::read_to_string(f.path("calls"))
+                .unwrap()
+                .lines()
+                .any(|s| s == "move")
+        );
+    }
+}
+
+#[test]
+fn transfer_failures_and_mismatched_responses_are_uncertain_without_retries() {
+    for response in [
+        json!({"id":"CANARY","organizationId":ORG,"collectionIds":[COLLECTION]}),
+        json!({"id":ID,"organizationId":"CANARY","collectionIds":[COLLECTION]}),
+        json!({"id":ID,"organizationId":ORG,"collectionIds":[]}),
+        json!({"id":ID,"organizationId":ORG,"collectionIds":["CANARY"]}),
+        json!({"id":ID,"organizationId":ORG,"collectionIds":[COLLECTION,COLLECTION]}),
+        json!({"id":ID,"organizationId":ORG}),
+        json!(null),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.path("transfer-response.json"), response.to_string()).unwrap();
+        assert_transfer_uncertain(&f);
+    }
+    for marker in ["mutation-fail", "bad-response"] {
+        let f = Fixture::new();
+        fs::write(f.path(marker), "").unwrap();
+        assert_transfer_uncertain(&f);
+    }
+}
+
+fn assert_transfer_uncertain(f: &Fixture) {
+    let out = f.call(&transfer_args());
+    assert!(!out.status.success());
+    public(&out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("outcome uncertain"));
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\nmove\n"
+    );
+}
+
+#[test]
+fn transfer_reuses_dependency_session_and_lock_guards() {
+    for failure in ["bad-version", "session", "lock"] {
+        let f = Fixture::new();
+        let held = fs::File::open(f.path("vault.lock")).unwrap();
+        match failure {
+            "bad-version" => fs::write(f.path("bad-version"), "").unwrap(),
+            "session" => assert!(f.call(&["lock"]).status.success()),
+            "lock" => fs2::FileExt::lock_exclusive(&held).unwrap(),
+            _ => unreachable!(),
+        }
+        let out = f.call(&transfer_args());
+        assert!(!out.status.success());
+        public(&out);
+        assert!(
+            !fs::read_to_string(f.path("calls"))
+                .unwrap_or_default()
+                .lines()
+                .any(|c| matches!(c, "sync" | "get" | "move"))
+        );
     }
 }
