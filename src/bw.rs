@@ -6,7 +6,11 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
-use std::{os::unix::process::CommandExt, sync::mpsc, time::Instant};
+use std::{
+    os::unix::process::{CommandExt, ExitStatusExt},
+    sync::mpsc,
+    time::Instant,
+};
 use zeroize::Zeroizing;
 
 pub(crate) const VERSION: &str = "2026.8.0";
@@ -52,13 +56,13 @@ impl<'a> Bw<'a> {
             .arg("--nointeraction")
             .env("BW_SESSION", token);
         captured_input(command, Duration::from_secs(90), 16 * 1024 * 1024, Some(input))
-            .map_err(|_| anyhow::anyhow!("mutation outcome uncertain: backend failed; inspect vault before retrying (not automatically retried)"))
+            .map_err(|error| anyhow::anyhow!("mutation outcome uncertain: {error}; inspect vault before retrying (not automatically retried)"))
     }
     pub fn soft_delete(&self, id: &str, token: &str) -> Result<()> {
         // Pinned cli-v2026.8.0 apps/cli/src/vault/delete.command.ts selects
         // softDeleteWithServer unless --permanent is supplied. Never expose it.
         let _response = Zeroizing::new(self.call(&["delete", "item", id], Some(token))
-            .map_err(|_| anyhow::anyhow!("delete outcome uncertain: backend failed; inspect vault before retrying (not automatically retried)"))?);
+            .map_err(|error| anyhow::anyhow!("delete outcome uncertain: {error}; inspect vault before retrying (not automatically retried)"))?);
         Ok(())
     }
     pub fn configure_server(&self, saved_server_changed: bool) -> Result<()> {
@@ -158,6 +162,23 @@ pub(crate) fn clean_auth_env(command: &mut Command) {
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
 }
 
+// Match complete pinned-backend messages, never substrings of arbitrary error text.
+// Only these static categories cross the process boundary; raw stderr is not logged.
+fn classify_stderr(bytes: &[u8]) -> &'static str {
+    match std::str::from_utf8(bytes).unwrap_or("").trim() {
+        "You do not have permission to add items to this collection." => {
+            "collection_permission_denied: collection unavailable or not editable"
+        }
+        "You do not have permission to edit this item" => "item_permission_denied",
+        "This item already belongs to an organization." => "already_organization_owned",
+        "Not found." => "not_found",
+        "`requestJson` was not provided." => "missing_request_data",
+        "Error parsing the encoded request data." => "invalid_request_data",
+        "You must provide at least one collection id for this item." => "missing_collection",
+        _ => "unclassified backend error (details withheld)",
+    }
+}
+
 fn captured(command: Command) -> Result<String> {
     captured_with_limits(command, Duration::from_secs(90), 16 * 1024 * 1024)
 }
@@ -181,7 +202,7 @@ fn captured_input(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("cannot start configured bw executable")?;
     // Concurrent writing keeps a non-reading backend inside the process deadline.
@@ -195,6 +216,18 @@ fn captured_input(
             let _ = input_sender.send(result);
         });
     }
+    // Drain stderr concurrently under its own bound, including on successful exits.
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (error_sender, error_receiver) = mpsc::channel();
+    const STDERR_LIMIT: usize = 64 * 1024;
+    std::thread::spawn(move || {
+        let mut buffer = Zeroizing::new(Vec::with_capacity(STDERR_LIMIT + 1));
+        let result = stderr
+            .take(STDERR_LIMIT as u64 + 1)
+            .read_to_end(&mut buffer)
+            .map(|_| buffer);
+        let _ = error_sender.send(result);
+    });
     let stdout = child.stdout.take().expect("stdout is piped");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -208,16 +241,21 @@ fn captured_input(
     let deadline = Instant::now() + timeout;
     let mut status = None;
     let mut bytes = None;
+    let mut error_bytes = None;
+    let mut input_failed = false;
     let result = (|| -> Result<String> {
         loop {
             if !input_done {
                 match input_receiver.try_recv() {
                     Ok(result) => {
-                        result.context("cannot write bw input")?;
+                        input_failed = result.is_err();
                         input_done = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => (),
-                    Err(mpsc::TryRecvError::Disconnected) => bail!("cannot write bw input"),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        input_failed = true;
+                        input_done = true;
+                    }
                 }
             }
             if bytes.is_none() {
@@ -234,14 +272,39 @@ fn captured_input(
                     Err(mpsc::TryRecvError::Disconnected) => bail!("cannot read bw output"),
                 }
             }
+            if error_bytes.is_none() {
+                match error_receiver.try_recv() {
+                    Ok(result) => {
+                        let buffer = result.context("cannot read bw diagnostic output")?;
+                        ensure!(
+                            buffer.len() <= STDERR_LIMIT,
+                            "bw diagnostic output exceeded the size limit"
+                        );
+                        error_bytes = Some(buffer);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => (),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        bail!("cannot read bw diagnostic output")
+                    }
+                }
+            }
             if status.is_none() {
                 status = child.try_wait().context("cannot inspect bw process")?;
             }
-            if let Some(status) = status {
-                ensure!(
-                    status.success(),
-                    "bw operation failed; check login, connectivity, and compatibility with latch doctor"
-                );
+            if let Some(status) = status
+                && let Some(stderr) = error_bytes.as_ref()
+            {
+                if !status.success() {
+                    if let Some(signal) = status.signal() {
+                        bail!("bw process terminated by signal {signal}");
+                    }
+                    bail!(
+                        "bw exited with code {}: {}",
+                        status.code().unwrap_or(-1),
+                        classify_stderr(stderr)
+                    );
+                }
+                ensure!(!input_failed, "cannot write bw input");
                 if input_done && let Some(bytes) = bytes.take() {
                     return String::from_utf8(bytes)
                         .map_err(|_| anyhow::anyhow!("bw returned non-UTF-8 output"));
@@ -372,6 +435,76 @@ else: sys.exit(1)
         )
         .unwrap();
         assert_eq!(output, "synthetic");
+    }
+    #[test]
+    fn classifies_only_complete_known_messages() {
+        let known = "You do not have permission to add items to this collection.";
+        assert!(classify_stderr(known.as_bytes()).contains("collection_permission_denied"));
+        for unknown in [
+            format!("{known} CANARY"),
+            format!("CANARY\n{known}"),
+            "CANARY".into(),
+        ] {
+            assert_eq!(
+                classify_stderr(unknown.as_bytes()),
+                "unclassified backend error (details withheld)"
+            );
+        }
+        assert_eq!(
+            classify_stderr(&[255]),
+            "unclassified backend error (details withheld)"
+        );
+        let error = captured_with_limits(
+            shell("echo 'You do not have permission to add items to this collection.' >&2; exit 1"),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("code 1: collection_permission_denied")
+        );
+    }
+    #[test]
+    fn diagnostic_flood_signal_and_inherited_pipe_are_bounded() {
+        let error = captured_with_limits(shell("yes CANARY >&2"), Duration::from_secs(2), 1024)
+            .unwrap_err();
+        assert!(error.to_string().contains("diagnostic output exceeded"));
+        assert!(!format!("{error:#}").contains("CANARY"));
+        let error =
+            captured_with_limits(shell("kill -TERM $$"), Duration::from_secs(2), 1024).unwrap_err();
+        assert!(error.to_string().contains("signal 15"));
+        let error = captured_with_limits(
+            shell("sleep 10 >&2 & exit 1"),
+            Duration::from_millis(150),
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+    #[test]
+    fn early_rejection_retains_diagnostics_when_stdin_breaks() {
+        let error = captured_input(
+            shell("echo 'You do not have permission to add items to this collection.' >&2; exit 1"),
+            Duration::from_secs(2),
+            1024,
+            Some(Zeroizing::new("CANARY".repeat(100_000))),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("collection_permission_denied"));
+        assert!(!format!("{error:#}").contains("CANARY"));
+        let error = captured_with_limits(
+            Command::new("/nonexistent/latch-test"),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot start configured bw executable")
+        );
     }
     #[test]
     fn backend_failures_do_not_include_output() {

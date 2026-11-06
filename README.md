@@ -151,6 +151,16 @@ the local state lock. Avoid concurrent edits in other clients. Success returns o
 destination. Backend failures or invalid responses can have an uncertain outcome;
 inspect the vault before retrying. No credentials are printed or rotated.
 
+Backend failures now retain safe process diagnostics (exit code, signal, timeout,
+I/O or output-limit failure). A small allowlist of exact Bitwarden messages maps
+only to fixed categories; raw stderr and unknown backend text are never printed
+or saved. For example, `collection_permission_denied` means the pinned CLI could
+not find the destination collection in that organization or considered it
+non-editable; it does not by itself distinguish permissions from server/client
+compatibility. Verify the collection and your access in the vault client before
+retrying. Mutation errors retain the uncertain-outcome warning and are never
+automatically retried.
+
 ### Create or update secrets
 
 `latch create` creates a personal login item. `latch update ITEM_UUID` patches an existing login item, including rotating its stored password or custom fields. Both accept strict JSON through piped or redirected stdin (maximum 1 MiB), never secret command-line arguments. Have your credential-producing process serialize JSON directly into the pipe; do not paste real secrets into shell history.

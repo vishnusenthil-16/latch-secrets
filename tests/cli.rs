@@ -68,6 +68,8 @@ if args[0] in ('create', 'edit'):
     import base64
     assert args == (['create', 'item', '--nointeraction'] if args[0] == 'create' else ['edit', 'item', item['id'], '--nointeraction'])
     payload = json.loads(base64.b64decode(sys.stdin.read()))
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     payload['id'] = '00000000-0000-4000-8000-000000000001'
@@ -80,6 +82,8 @@ if args[0] == 'move':
     assert args == ['move', item['id'], '00000000-0000-4000-8000-000000000002', '--nointeraction']
     collections = json.loads(base64.b64decode(sys.stdin.read()))
     assert item.get('organizationId') is None
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     item['organizationId'] = args[2]
@@ -92,6 +96,8 @@ if args[0] == 'move':
 if args[0] == 'delete':
     assert args == ['delete', 'item', item['id'], '--nointeraction']
     assert item.get('deletedDate') is None
+    if (root/'permission-fail').exists():
+        print('You do not have permission to add items to this collection.', file=sys.stderr); sys.exit(1)
     if (root/'mutation-fail').exists():
         print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
     item['deletedDate'] = '2026-09-28T00:00:00Z'
@@ -1649,6 +1655,21 @@ fn assert_transfer_uncertain(f: &Fixture) {
     assert!(!out.status.success());
     public(&out);
     assert!(String::from_utf8_lossy(&out.stderr).contains("outcome uncertain"));
+    assert_eq!(
+        fs::read_to_string(f.path("calls")).unwrap(),
+        "--version\nstatus\nsync\nget\nmove\n"
+    );
+}
+
+#[test]
+fn transfer_reports_safe_backend_category_without_retry() {
+    let f = Fixture::new();
+    fs::write(f.path("permission-fail"), "").unwrap();
+    let out = f.call(&transfer_args());
+    public(&out);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("outcome uncertain"));
+    assert!(error.contains("code 1: collection_permission_denied"));
     assert_eq!(
         fs::read_to_string(f.path("calls")).unwrap(),
         "--version\nstatus\nsync\nget\nmove\n"
