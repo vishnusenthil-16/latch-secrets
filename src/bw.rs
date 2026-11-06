@@ -158,12 +158,16 @@ pub(crate) fn clean_auth_env(command: &mut Command) {
     // Disable inherited debugging switches that could cause the runtime to log credentials.
     command
         .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_DEBUG")
+        .env_remove("FORCE_COLOR")
         .env_remove("NODE_EXTRA_CA_CERTS")
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
 }
 
 // Match complete pinned-backend messages, never substrings of arbitrary error text.
 // Only these static categories cross the process boundary; raw stderr is not logged.
+const UNCLASSIFIED: &str = "unclassified backend error (details withheld)";
+
 fn classify_stderr(bytes: &[u8]) -> &'static str {
     match std::str::from_utf8(bytes).unwrap_or("").trim() {
         "You do not have permission to add items to this collection." => {
@@ -175,7 +179,7 @@ fn classify_stderr(bytes: &[u8]) -> &'static str {
         "`requestJson` was not provided." => "missing_request_data",
         "Error parsing the encoded request data." => "invalid_request_data",
         "You must provide at least one collection id for this item." => "missing_collection",
-        _ => "unclassified backend error (details withheld)",
+        _ => UNCLASSIFIED,
     }
 }
 
@@ -217,15 +221,21 @@ fn captured_input(
         });
     }
     // Drain stderr concurrently under its own bound, including on successful exits.
-    let stderr = child.stderr.take().expect("stderr is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
     let (error_sender, error_receiver) = mpsc::channel();
     const STDERR_LIMIT: usize = 64 * 1024;
     std::thread::spawn(move || {
         let mut buffer = Zeroizing::new(Vec::with_capacity(STDERR_LIMIT + 1));
-        let result = stderr
-            .take(STDERR_LIMIT as u64 + 1)
-            .read_to_end(&mut buffer)
-            .map(|_| buffer);
+        let result = (|| {
+            stderr
+                .by_ref()
+                .take(STDERR_LIMIT as u64 + 1)
+                .read_to_end(&mut buffer)?;
+            // Retain only a bounded prefix, but never interrupt a backend because
+            // diagnostics are verbose. The extra byte marks truncated messages.
+            std::io::copy(&mut stderr, &mut std::io::sink())?;
+            Ok::<_, std::io::Error>(buffer)
+        })();
         let _ = error_sender.send(result);
     });
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -243,6 +253,7 @@ fn captured_input(
     let mut bytes = None;
     let mut error_bytes = None;
     let mut input_failed = false;
+    let mut input_failure_deadline = None;
     let result = (|| -> Result<String> {
         loop {
             if !input_done {
@@ -276,10 +287,6 @@ fn captured_input(
                 match error_receiver.try_recv() {
                     Ok(result) => {
                         let buffer = result.context("cannot read bw diagnostic output")?;
-                        ensure!(
-                            buffer.len() <= STDERR_LIMIT,
-                            "bw diagnostic output exceeded the size limit"
-                        );
                         error_bytes = Some(buffer);
                     }
                     Err(mpsc::TryRecvError::Empty) => (),
@@ -298,10 +305,19 @@ fn captured_input(
                     if let Some(signal) = status.signal() {
                         bail!("bw process terminated by signal {signal}");
                     }
-                    bail!(
-                        "bw exited with code {}: {}",
-                        status.code().unwrap_or(-1),
+                    let category = if stderr.len() > STDERR_LIMIT {
+                        UNCLASSIFIED
+                    } else {
                         classify_stderr(stderr)
+                    };
+                    let hint = if category == UNCLASSIFIED {
+                        "; check login, connectivity, and compatibility with latch doctor"
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "bw exited with code {}: {category}{hint}",
+                        status.code().unwrap_or(-1)
                     );
                 }
                 ensure!(!input_failed, "cannot write bw input");
@@ -309,6 +325,13 @@ fn captured_input(
                     return String::from_utf8(bytes)
                         .map_err(|_| anyhow::anyhow!("bw returned non-UTF-8 output"));
                 }
+            }
+            if input_failed {
+                // Allow a brief window for early rejection diagnostics, not the
+                // full operation timeout if the backend closes stdin and hangs.
+                let failure_deadline = input_failure_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
+                ensure!(Instant::now() < *failure_deadline, "cannot write bw input");
             }
             ensure!(Instant::now() < deadline, "bw operation timed out");
             std::thread::sleep(Duration::from_millis(10));
@@ -438,6 +461,39 @@ else: sys.exit(1)
     }
     #[test]
     fn classifies_only_complete_known_messages() {
+        for (message, category) in [
+            (
+                "You do not have permission to edit this item",
+                "item_permission_denied",
+            ),
+            (
+                "This item already belongs to an organization.",
+                "already_organization_owned",
+            ),
+            ("Not found.", "not_found"),
+            ("`requestJson` was not provided.", "missing_request_data"),
+            (
+                "Error parsing the encoded request data.",
+                "invalid_request_data",
+            ),
+            (
+                "You must provide at least one collection id for this item.",
+                "missing_collection",
+            ),
+        ] {
+            assert_eq!(
+                classify_stderr(format!(" {message}\n").as_bytes()),
+                category
+            );
+            assert_eq!(
+                classify_stderr(format!("{message} CANARY").as_bytes()),
+                UNCLASSIFIED
+            );
+            assert_eq!(
+                classify_stderr(format!("CANARY {message}").as_bytes()),
+                UNCLASSIFIED
+            );
+        }
         let known = "You do not have permission to add items to this collection.";
         assert!(classify_stderr(known.as_bytes()).contains("collection_permission_denied"));
         for unknown in [
@@ -468,9 +524,9 @@ else: sys.exit(1)
     }
     #[test]
     fn diagnostic_flood_signal_and_inherited_pipe_are_bounded() {
-        let error = captured_with_limits(shell("yes CANARY >&2"), Duration::from_secs(2), 1024)
+        let error = captured_with_limits(shell("yes CANARY >&2"), Duration::from_millis(150), 1024)
             .unwrap_err();
-        assert!(error.to_string().contains("diagnostic output exceeded"));
+        assert!(error.to_string().contains("timed out"));
         assert!(!format!("{error:#}").contains("CANARY"));
         let error =
             captured_with_limits(shell("kill -TERM $$"), Duration::from_secs(2), 1024).unwrap_err();
@@ -506,6 +562,49 @@ else: sys.exit(1)
                 .contains("cannot start configured bw executable")
         );
     }
+    #[test]
+    fn verbose_diagnostics_do_not_abort_success_or_hide_exit_status() {
+        for count in [10, 65536, 65537, 1000000] {
+            let script = format!("head -c {count} /dev/zero >&2; printf ok");
+            assert_eq!(
+                captured_with_limits(shell(&script), Duration::from_secs(5), 1024).unwrap(),
+                "ok"
+            );
+            let error = captured_with_limits(
+                shell(&format!("{script}; exit 7")),
+                Duration::from_secs(5),
+                1024,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("code 7: unclassified backend error"));
+            assert!(error.contains("latch doctor"));
+        }
+        // A truncated prefix that trims to a known message must not classify.
+        let error = captured_with_limits(
+            shell("printf 'Not found.' >&2; head -c 70000 /dev/zero | tr '\\000' ' ' >&2; exit 7"),
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unclassified backend error"));
+    }
+
+    #[test]
+    fn closed_stdin_does_not_wait_for_operation_timeout() {
+        let start = Instant::now();
+        let error = captured_input(
+            shell("exec 0<&-; sleep 10"),
+            Duration::from_secs(5),
+            1024,
+            Some(Zeroizing::new("CANARY".repeat(100_000))),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "cannot write bw input");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn backend_failures_do_not_include_output() {
         let error = captured_with_limits(

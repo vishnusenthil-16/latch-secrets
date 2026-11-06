@@ -1698,3 +1698,39 @@ fn transfer_reuses_dependency_session_and_lock_guards() {
         );
     }
 }
+
+#[test]
+fn mutation_categories_are_safe_json_errors_without_retries() {
+    for operation in ["create", "update", "delete"] {
+        let f = Fixture::new();
+        fs::write(f.path("permission-fail"), "").unwrap();
+        let out = match operation {
+            "create" => f.input(
+                &["create"],
+                r#"{"name":"service","login":{"password":"CANARY"}}"#,
+            ),
+            "update" => f.input(&["update", ID], r#"{"login":{"password":"CANARY"}}"#),
+            _ => f.call(&["delete", ID]),
+        };
+        assert!(!out.status.success());
+        public(&out);
+        let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+        let error = error["error"]["message"].as_str().unwrap();
+        assert!(error.contains("outcome uncertain"));
+        assert!(error.contains("code 1: collection_permission_denied"));
+        let verb = if operation == "update" {
+            "edit"
+        } else {
+            operation
+        };
+        assert_eq!(
+            fs::read_to_string(f.path("calls"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == verb)
+                .count(),
+            1
+        );
+        assert!(!f.path("item.json").exists());
+    }
+}
