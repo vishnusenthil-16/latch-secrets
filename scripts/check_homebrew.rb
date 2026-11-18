@@ -30,7 +30,8 @@ Dir.mktmpdir("latch-homebrew-check-") do |temporary|
   local_url = "file://#{URI::DEFAULT_PARSER.escape(archive.to_s)}"
   raise "Expected one formula URL" unless source.scan(/^  url /).length == 1
   formula_path.write(source.sub(/^  url .*$/, "  url #{local_url.dump}"))
-  formula = Formulary.factory(formula_path)
+  # Newer Homebrew reserves factory for formula names; paths have a dedicated loader.
+  formula = Formulary.respond_to?(:from_path) ? Formulary.from_path(formula_path) : Formulary.factory(formula_path)
   prefix = root/"prefix"
   formula.define_singleton_method(:prefix) { |_version = nil| prefix }
   formula.define_singleton_method(:logs) { root/"logs" }

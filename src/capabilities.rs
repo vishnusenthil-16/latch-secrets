@@ -42,7 +42,8 @@ pub(crate) fn manifest() -> Value {
         "schema_version": 1,
         "name": "latch",
         "version": env!("CARGO_PKG_VERSION"),
-        "supported_platforms": ["macos"],
+        "supported_platforms": ["macos", "linux"],
+        "linux_architectures": ["x86_64", "aarch64"],
         "commands": commands,
         "discovery": {
             "requires_configuration": false,
@@ -56,7 +57,10 @@ pub(crate) fn manifest() -> Value {
             "login_command": ["latch", "login"],
             "login_api_key_command": ["latch", "login", "--api-key"],
             "agent_instruction": "Ask the user to run login in their terminal; never request credentials in chat.",
-            "noninteractive_commands_prompt_for_login": false
+            "noninteractive_commands_prompt_for_login": false,
+            "session_backends": {"macos": ["keychain"], "linux": ["memory", "secret-service"]},
+            "memory_backend_scope": "Only the broker BW_SESSION token; bw authentication and encrypted vault state persist on disk",
+            "helper_restart": "memory mode requires login again; losing a helper is not bw lock or logout"
         },
         "bindings": {
             "syntax": "NAME=ITEM_UUID/FIELD",
@@ -115,7 +119,7 @@ pub(crate) fn manifest() -> Value {
             "command": ["latch", "browser", "fill"],
             "required_flags": ["item", "target", "selector"],
             "optional_flags": ["endpoint"],
-            "runtime": "Default: Latch Chrome extension and native host (macOS). With --endpoint: Node.js 22.4+ and loopback browser CDP",
+            "runtime": "Default: Latch Chrome extension and native host (macOS/Linux). With --endpoint: Node.js 22.4+ and loopback browser CDP",
             "targets_command": ["latch", "browser", "targets", "--item", "ITEM_UUID", "--json"],
             "install_command": ["latch", "browser", "install-host", "--browser", "chrome"],
             "target_lifetime": "60 seconds; single attempt; invalidated by document navigation or host reconnection",

@@ -6,6 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import tarfile
+
+from linux_release import TARGETS, archive_name, inspect_archive
 
 
 def verify(bundle: Path, tag: str, repository: str, expected: Path | None = None) -> dict:
@@ -18,7 +21,23 @@ def verify(bundle: Path, tag: str, repository: str, expected: Path | None = None
             or metadata.get("version") != version or metadata.get("repository") != repository
             or metadata.get("archive") != archive):
         raise ValueError("release metadata mismatch or non-publishable snapshot")
+    binaries = metadata.get("binaries", {})
+    if not isinstance(binaries, dict) or (binaries and set(binaries) != set(TARGETS)):
+        raise ValueError("Linux release must contain exactly both supported targets")
     digests = {}
+    for target, entry in binaries.items():
+        name = archive_name(version, target)
+        if not isinstance(entry, dict) or set(entry) != {"archive", "sha256"} or entry["archive"] != name:
+            raise ValueError("Linux asset metadata mismatch")
+        digest = inspect_archive(bundle / name, target, metadata)
+        if entry["sha256"] != digest:
+            raise ValueError("Linux archive checksum mismatch")
+        digests[name] = digest
+    inventory = {archive, "Formula/latch-secrets.rb", "SHA256SUMS", "release.json"}
+    inventory.update(entry["archive"] for entry in binaries.values())
+    actual = {p.relative_to(bundle).as_posix() for p in bundle.rglob("*") if not p.is_dir()}
+    if actual != inventory or any(p.is_symlink() for p in bundle.rglob("*")):
+        raise ValueError("release bundle contains missing, unexpected, or symlink assets")
     for relative in (archive, "Formula/latch-secrets.rb"):
         path = bundle / relative
         if path.is_symlink() or not path.is_file():
@@ -62,6 +81,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         verify(args.bundle, args.tag, args.repository, args.expected)
-    except (ValueError, OSError, KeyError) as error:
+    except (ValueError, OSError, KeyError, tarfile.TarError) as error:
         parser.exit(1, f"release verification failed: {error}\n")
     print("Release bundle checksums and metadata verified.")

@@ -15,6 +15,16 @@ Inspect `latch capabilities --json` for the installed CLI's versioned interface,
 4. Inject selected fields: `latch run --env NAME=ITEM_UUID/login.password -- command args`. Other selectors are `login.username`, `sshKey.privateKey`, `sshKey.publicKey`, `sshKey.keyFingerprint`, and `custom.NAME`. SSH selectors require a native SSH-key item (type 5); multiline private keys are preserved by `run` and `write --zshrc` (`write --dotenv` rejects multiline values). `write` produces environment assignments, not raw SSH identity files.
 5. Use `latch write --env NAME=ITEM_UUID/FIELD --dotenv PATH` or `--zshrc PATH` only when the user explicitly wants plaintext persistence. Respect an existing authorization; do not ask twice. Written values are snapshots and remain after `latch lock`.
 
+## Platforms and session recovery
+
+Use the installed CLI's capabilities and `doctor --json` to determine support. macOS uses login Keychain and a LaunchAgent. Linux x86-64/ARM64 uses a systemd user helper with `memory` (default) or `secret-service` storage. The Linux baseline is Debian 12/glibc 2.36; 64-bit Raspberry Pi OS follows that userspace baseline, but physical Pi hardware is not yet qualified. Windows and 32-bit Linux are outside scope.
+
+For authorized setup, use `latch configure --server HTTPS_URL --bw /absolute/path/to/bw --session-backend memory` on headless Linux, or `--session-backend secret-service` for an unlocked desktop keyring. Bitwarden CLI must be version 2026.8.0. Omitting the backend on reconfiguration preserves the saved choice; never silently switch it. Preserve the intended `--state-dir` when repairing an installation.
+
+Check `session_backend`, `helper_backend_matches`, `storage_accessible`, `storage_error`, and `configuration_recovery_pending` in doctor output. If recovery is pending, repair with the saved configure settings before asking the user to log in. Do not change a stopped persistent installation to memory or another server to bypass recovery: a prior or timed-out write may still exist in the original store. Configuration must verify storage readiness before reporting success. If a memory helper has stopped, rerun configure to restore it, then ask the user to log in. A persistent helper or locked keyring needs its service/storage restored first; never delete keyring entries or state as an automatic repair.
+
+Memory mode retains only Latch's broker session token until lock or helper exit. Bitwarden can still persist authentication tokens and API client secrets in its own cache. A helper restart requires login again; it does not erase the cache or revoke credentials. `latch lock` clears the stored session and invokes Bitwarden lock, but cannot recall values already injected or written. Do not enable systemd lingering implicitly; it affects other user services and does not unlock the vault after reboot.
+
 ## Create and update
 
 When requested, use `latch create` or `latch update ITEM_UUID` with strict JSON piped directly from a trusted credential-producing process. Confirm the installed capabilities include these commands first. Input supports `name`, `login` containing `username`/`password`, and `fields` containing `{name,value,type}` entries (`type`: `text` or `hidden`). Creation requires a name and creates a personal login item. Updates preserve unspecified properties; new fields default hidden. Input is limited to 1 MiB and rejects nulls, unknown/duplicate keys, ambiguous fields, and empty updates. Never embed real values in shell commands or conversation.
@@ -48,7 +58,8 @@ Do not call `bw` or the internal session broker directly. Do not read Latch's pr
 When capabilities includes `browser_fill.targets_command`, use `latch browser targets
 --item UUID --json` to discover authorized matching tabs, then `latch browser fill
 --item UUID --target HANDLE --selector CSS --json`. This works with existing Chrome
-profiles on macOS after the user loads the Latch extension and grants site access.
+profiles on macOS and Linux after the user loads the Latch extension and grants site access.
+Linux supports native Chrome/Chromium packages; Snap/Flatpak browser integration is not qualified.
 `latch browser install-host --browser chrome --json` installs the host and reports
 extension setup instructions; an agent cannot grant site permissions silently.
 Targets expire after 60 seconds and permit one attempt. Use profile labels, origins

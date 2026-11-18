@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, cp, readdir} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join, isAbsolute} from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {createConnection} from 'node:net';
 import {chromium} from 'playwright';
@@ -63,10 +63,13 @@ test('real native host + MV3 extension: existing document, isolated fill, naviga
   await writeFile(join(extension,'manifest.json'),JSON.stringify(manifest));
   const binary=join(dir,'latch');
   await cp(new URL('../../target/debug/latch',import.meta.url),binary);
-  execFileSync(binary,['browser','install-host','--browser','chrome-for-testing','--user-data-dir',join(dir,'profile')],{env:{...process.env,HOME:dir,LATCH_BROWSER_HOME:dir}});
+  const installed=JSON.parse(execFileSync(binary,['browser','install-host','--json','--browser','chrome-for-testing','--user-data-dir',join(dir,'profile')],{env:{...process.env,HOME:dir,LATCH_BROWSER_HOME:dir},encoding:'utf8'}));
+  assert.equal(installed.manifest,join(dir,'profile','NativeMessagingHosts','com.latch_secrets.browser.json'));
+  const executablePath=process.env.LATCH_TEST_CHROMIUM_EXECUTABLE;
+  if(executablePath) assert.ok(isAbsolute(executablePath),'LATCH_TEST_CHROMIUM_EXECUTABLE must be absolute');
   const runtime=join(dir,'.latch-browser');
   const before=await readdir(runtime).catch(()=>[]);
-  const context=await chromium.launchPersistentContext(join(dir,'profile'),{channel:'chromium',headless:true,env:{...process.env,HOME:dir,LATCH_BROWSER_HOME:dir},
+  const context=await chromium.launchPersistentContext(join(dir,'profile'),{...(executablePath ? {executablePath} : {channel:'chromium'}),headless:true,env:{...process.env,HOME:dir,LATCH_BROWSER_HOME:dir},
     args:[`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
   try {
     if (!context.serviceWorkers().length) await context.waitForEvent('serviceworker');

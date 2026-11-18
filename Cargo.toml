@@ -27,5 +27,10 @@ zeroize = "1"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "time"] }
+sha2 = "0.10"
+
 [dev-dependencies]
 dotenvy = "0.15"

@@ -1,4 +1,4 @@
-name: Publish macOS Homebrew release
+name: Publish macOS and Linux release
 
 on:
   push:
@@ -58,8 +58,48 @@ jobs:
           path: ${{ runner.temp }}/latch-release/
           if-no-files-found: error
 
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install packaging tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 dbus systemd libsecret-tools gnome-keyring zsh
+      - name: Test and build native release
+        run: |
+          cargo test --locked --all-targets
+          cargo build --locked --release --target '${{ matrix.target }}'
+          target/${{ matrix.target }}/release/latch --version
+          python3 scripts/check_linux_keyring.py --latch target/${{ matrix.target }}/release/latch
+          python3 scripts/check_linux_dependencies.py --target '${{ matrix.target }}'
+      - name: Package verified native binary
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/package_linux.py --binary 'target/${{ matrix.target }}/release/latch' --target '${{ matrix.target }}' --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --output "$RUNNER_TEMP/linux-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: ${{ runner.temp }}/linux-release/
+          if-no-files-found: error
+
   publish:
-    needs: package
+    needs: [package, linux]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -77,12 +117,18 @@ jobs:
         with:
           name: homebrew-release
           path: ${{ runner.temp }}/bundle
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: ${{ runner.temp }}/linux-artifacts
+          merge-multiple: true
       - name: Verify and publish stable release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
+          python3 scripts/assemble_release.py --bundle "$RUNNER_TEMP/bundle" --artifacts "$RUNNER_TEMP/linux-artifacts" --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
           python3 scripts/prepare_release.py --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --output "$RUNNER_TEMP/expected-release"
           python3 scripts/verify_release.py --bundle "$RUNNER_TEMP/bundle" --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --expected "$RUNNER_TEMP/expected-release"
           SOURCE_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$RUNNER_TEMP/bundle/release.json")
