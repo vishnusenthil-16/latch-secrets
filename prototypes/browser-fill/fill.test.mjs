@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {chromium} from 'playwright';
 import {fill,fillDocument} from './fill.mjs';
+import {waitForDevToolsEndpoint} from './cdp-ready.mjs';
 
 test('document-bound fill, origin rejection, and field validation', async()=>{
  const browser=await chromium.launch({headless:true});
@@ -101,13 +102,13 @@ test('isolated-world subframe rejection and stale-document navigation',async()=>
 
 test('CLI metadata-only success, rejection and error output',async()=>{
  const {spawn}=await import('node:child_process');
- const {mkdtemp,readFile,rm}=await import('node:fs/promises');
+ const {mkdtemp,rm}=await import('node:fs/promises');
  const {tmpdir}=await import('node:os');
  const {join}=await import('node:path');
  const dir=await mkdtemp(join(tmpdir(),'latch-browser-test-'));
- const context=await chromium.launchPersistentContext(dir,{headless:true,args:['--remote-debugging-port=0']});
+ const context=await chromium.launchPersistentContext(dir,{channel:'chromium',headless:true,args:['--remote-debugging-port=0']});
  try {
-  const port=(await readFile(join(dir,'DevToolsActivePort'),'utf8')).split('\n')[0];
+  const port=new URL(await waitForDevToolsEndpoint(dir)).port;
   const page=context.pages()[0];
   await page.route('https://fixture.test/**',r=>r.fulfill({contentType:'text/html',body:'<form><input id="p" type="password"></form>'}));
   await page.goto('https://fixture.test/');

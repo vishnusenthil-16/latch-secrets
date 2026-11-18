@@ -33,13 +33,17 @@ def find_release(repository: str, tag: str) -> dict | None:
 
 
 def publish(bundle: Path, tag: str, repository: str) -> None:
-    verify(bundle, tag, repository)
+    metadata = verify(bundle, tag, repository)
     names = (f"latch-secrets-{tag[1:]}.tar.gz", "latch-secrets.rb", "SHA256SUMS", "release.json")
     paths = (bundle / names[0], bundle / "Formula/latch-secrets.rb", bundle / names[2], bundle / names[3])
+    for target in sorted(metadata.get("binaries", {})):
+        name = metadata["binaries"][target]["archive"]
+        names += (name,)
+        paths += (bundle / name,)
     release = find_release(repository, tag)
     if release is None:
         gh("release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
-           "--title", f"Latch {tag}", "--notes", "macOS source release with Homebrew formula.")
+           "--title", f"Latch {tag}", "--notes", "macOS source release with Homebrew formula and Linux binaries when listed in release.json.")
         # GitHub may acknowledge draft creation before its paginated release
         # list includes it. Retry only this post-create visibility gap.
         for attempt in range(DRAFT_VISIBILITY_ATTEMPTS):

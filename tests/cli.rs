@@ -1,6 +1,6 @@
 //! Public CLI flows against a synthetic bw process and local in-memory broker.
 //! These tests never contact a vault, install a LaunchAgent, or touch Keychain.
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -24,9 +24,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_legacy_keychain(None)
+    }
+    fn with_legacy_keychain(accessible: Option<bool>) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("latch-test-")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
             .unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(dir.path().join("bw")).unwrap();
@@ -57,6 +60,8 @@ assert os.environ.get('BW_CLIENTSECRET') is None
 assert os.environ.get('LATCH_MASTER_PASSWORD') is None
 if (root/'fail').exists():
     print('CANARY_backend_error'); print('CANARY_backend_error', file=sys.stderr); sys.exit(1)
+if args[0] == 'status' and os.environ.get('BW_SESSION'):
+    (root/'status-with-session').touch()
 if args[0] == 'status':
     print(json.dumps({'status':'unauthenticated' if (root/'unauthenticated').exists() else ('unlocked' if os.environ.get('BW_SESSION') == 'SYNTHETIC_SESSION' else 'locked'), 'lastSync':'2026-01-01T00:00:00Z', 'userEmail':'PRIVATE_METADATA', 'serverUrl': (root/'server-url').read_text() if (root/'server-url').exists() else ('https://vault.example.test' if (root/'bw').exists() else 'https://vault.bitwarden.com')})); sys.exit(0)
 if args[0] == 'lock':
@@ -131,7 +136,11 @@ else: sys.exit(7)
         let stop = Arc::new(AtomicBool::new(false));
         let finish = stop.clone();
         let worker = thread::spawn(move || {
-            let mut token = Some("SYNTHETIC_SESSION".to_string());
+            let mut token = if accessible == Some(true) {
+                None
+            } else {
+                Some("SYNTHETIC_SESSION".to_string())
+            };
             while !finish.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -142,22 +151,34 @@ else: sys.exit(7)
                         let mut buf = Vec::new();
                         stream.read_to_end(&mut buf).unwrap();
                         let req: Value = serde_json::from_slice(&buf).unwrap();
-                        let response = match req["op"].as_str() {
-                            Some("get") => match &token {
-                                Some(t) => json!({"ok":true,"token":t}),
-                                None => json!({"ok":false}),
-                            },
-                            Some("get_optional") => json!({"ok":true,"token":token}),
-                            Some("put") => {
-                                token = Some(req["token"].as_str().unwrap().to_owned());
-                                json!({"ok":true})
+                        let operation = req["op"].as_str();
+                        let response = if (accessible.is_some()
+                            && matches!(operation, Some("info" | "ping")))
+                            || (accessible == Some(false)
+                                && matches!(operation, Some("get" | "get_optional")))
+                        {
+                            json!({"ok":false})
+                        } else {
+                            match operation {
+                                Some("get") => match &token {
+                                    Some(t) => json!({"ok":true,"token":t}),
+                                    None => json!({"ok":false}),
+                                },
+                                Some("get_optional") => json!({"ok":true,"token":token}),
+                                Some("put") => {
+                                    token = Some(req["token"].as_str().unwrap().to_owned());
+                                    json!({"ok":true})
+                                }
+                                Some("delete") => {
+                                    token = None;
+                                    json!({"ok":true})
+                                }
+                                Some("probe") | Some("ping") => json!({"ok":true}),
+                                Some("info") => {
+                                    json!({"ok":true,"backend":if cfg!(target_os="macos") {"keychain"} else {"memory"}})
+                                }
+                                _ => json!({"ok":false}),
                             }
-                            Some("delete") => {
-                                token = None;
-                                json!({"ok":true})
-                            }
-                            Some("probe") => json!({"ok":true}),
-                            _ => json!({"ok":false}),
                         };
                         stream.write_all(response.to_string().as_bytes()).unwrap();
                     }
@@ -541,6 +562,7 @@ fn wrong_or_reset_endpoint_blocks_authentication_and_secret_operations() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn configure_preserves_existing_state_when_old_helper_is_unavailable() {
     for remove_socket in [false, true] {
         let mut fixture = Fixture::new();
@@ -568,6 +590,62 @@ fn configure_preserves_existing_state_when_old_helper_is_unavailable() {
         );
         public(&out);
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn mismatched_helper_cannot_authorize_reconfiguration_or_successful_lock() {
+    let fixture = Fixture::new();
+    let path = fixture.path("config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    // The mock broker is memory, but the saved installation owns a persistent
+    // store. Clearing that broker must not claim to clear the saved store.
+    config["session_backend"] = json!("secret-service");
+    fs::write(&path, config.to_string()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let out = fixture.call(&[
+        "configure",
+        "--server",
+        "https://other.example.test",
+        "--bw",
+        fixture.path("fake-bw").to_str().unwrap(),
+        "--session-backend",
+        "memory",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not match"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(fixture.path("calls")).unwrap(),
+        "--version\n"
+    );
+    let doctor = fixture.call(&["doctor"]);
+    assert!(doctor.status.success());
+    let result: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(result["helper_backend_matches"], false);
+    assert_eq!(result["session_accessible"], false);
+    assert_eq!(result["ready"], false);
+    let locked = fixture.call(&["lock"]);
+    assert!(!locked.status.success());
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("lock incomplete"));
+    assert!(fixture.path("locked").exists());
+}
+
+#[test]
+fn doctor_checks_server_before_supplying_the_session() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("server-url"), "https://other.example.test").unwrap();
+    let out = fixture.call(&["doctor"]);
+    assert!(out.status.success());
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["ready"], false);
+    assert!(!fixture.path("status-with-session").exists());
+    fs::write(fixture.path("server-url"), "https://vault.example.test").unwrap();
+    let out = fixture.call(&["doctor"]);
+    assert!(out.status.success());
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["ready"], true);
+    assert!(fixture.path("status-with-session").exists());
 }
 
 #[test]
@@ -1364,6 +1442,7 @@ fn browser_install_is_vault_independent_and_host_origin_is_silent() {
     let out = Command::new(env!("CARGO_BIN_EXE_latch"))
         .env("HOME", dir.path().join("isolated-agent-home"))
         .env("LATCH_BROWSER_HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .args(["browser", "install-host", "--json"])
         .output()
         .unwrap();
@@ -1374,7 +1453,11 @@ fn browser_install_is_vault_independent_and_host_origin_is_silent() {
     assert!(
         result["manifest"].as_str().unwrap().starts_with(
             dir.path()
-                .join("Library/Application Support")
+                .join(if cfg!(target_os = "macos") {
+                    "Library/Application Support"
+                } else {
+                    ".config"
+                })
                 .to_str()
                 .unwrap()
         )
@@ -1732,5 +1815,22 @@ fn mutation_categories_are_safe_json_errors_without_retries() {
             1
         );
         assert!(!f.path("item.json").exists());
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn doctor_distinguishes_legacy_locked_and_empty_keychain() {
+    for accessible in [false, true] {
+        let fixture = Fixture::with_legacy_keychain(Some(accessible));
+        let out = fixture.call(&["doctor"]);
+        assert!(out.status.success(), "{out:?}");
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["helper_reachable"], true);
+        assert_eq!(result["helper_backend_matches"], true);
+        assert_eq!(result["storage_accessible"], accessible);
+        assert_eq!(result["storage_error"].is_null(), accessible);
+        assert_eq!(result["session_accessible"], false);
+        assert_eq!(result["ready"], false);
     }
 }

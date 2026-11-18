@@ -94,10 +94,35 @@ fn verify_peer(stream: &UnixStream) -> Result<()> {
         let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut user, &mut group) };
         ensure!(result == 0 && user == uid(), "unauthorized browser peer");
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: stream owns a live socket; credentials and length are writable
+        // for their supplied sizes. Read credentials only after a complete result.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        ensure!(
+            result == 0 && length as usize == std::mem::size_of::<libc::ucred>(),
+            "unauthorized browser peer"
+        );
+        // SAFETY: the successful getsockopt above initialized the whole value.
+        ensure!(
+            unsafe { credentials.assume_init() }.uid == uid(),
+            "unauthorized browser peer"
+        );
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = stream;
-        bail!("browser bridge currently supports macOS only");
+        bail!("browser bridge supports macOS and Linux only");
     }
     Ok(())
 }
@@ -133,6 +158,106 @@ fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
     writer.flush()?;
     Ok(())
 }
+// Socket deadlines cover the entire header and body, not each successful read.
+// Native stdin/stdout stay on dedicated threads bounded by the dispatch deadline.
+fn socket_wait(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "browser frame deadline exceeded");
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let millis = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: descriptor is initialized and writable for exactly one pollfd;
+        // the borrowed stream keeps its descriptor live through the call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result > 0 {
+            ensure!(
+                descriptor.revents & libc::POLLNVAL == 0,
+                "browser socket unavailable"
+            );
+            return Ok(());
+        }
+        if result == 0 {
+            bail!("browser frame deadline exceeded");
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+}
+fn socket_read_exact(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        ensure!(Instant::now() < deadline, "browser frame deadline exceeded");
+        match stream.read(bytes) {
+            Ok(0) => bail!("browser connection closed"),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                socket_wait(stream, libc::POLLIN, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+fn read_socket_frame_until(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>> {
+    stream.set_nonblocking(true)?;
+    let mut header = [0; 4];
+    socket_read_exact(stream, &mut header, deadline)?;
+    let length = u32::from_ne_bytes(header) as usize;
+    ensure!(length > 0 && length <= LIMIT, "invalid browser frame size");
+    let mut bytes = Zeroizing::new(vec![0; length]);
+    socket_read_exact(stream, &mut bytes, deadline)?;
+    Ok(bytes)
+}
+fn write_socket_frame_until(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= LIMIT,
+        "invalid browser frame size"
+    );
+    stream.set_nonblocking(true)?;
+    let header = (bytes.len() as u32).to_ne_bytes();
+    for mut part in [&header[..], bytes] {
+        while !part.is_empty() {
+            ensure!(Instant::now() < deadline, "browser frame deadline exceeded");
+            match stream.write(part) {
+                Ok(0) => bail!("browser connection closed"),
+                Ok(count) => part = &part[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    socket_wait(stream, libc::POLLOUT, deadline)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+fn read_socket_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Zeroizing<Vec<u8>>> {
+    read_socket_frame_until(stream, Instant::now() + timeout)
+}
+fn write_socket_frame(stream: &mut UnixStream, bytes: &[u8]) -> Result<()> {
+    write_socket_frame_until(stream, bytes, Instant::now() + Duration::from_secs(2))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Rule {
@@ -246,14 +371,12 @@ fn same_lock(file: &File, path: &Path) -> bool {
     fd.nlink() == 1 && fd.dev() == named.dev() && fd.ino() == named.ino()
 }
 impl InstanceFiles {
-    #[cfg(not(target_os = "macos"))]
-    fn create(_path: PathBuf) -> Result<Self> {
-        bail!("browser bridge currently supports macOS only")
-    }
-    #[cfg(target_os = "macos")]
     fn create(mut path: PathBuf) -> Result<Self> {
         for _ in 0..16 {
+            #[cfg(target_os = "macos")]
             let flags = libc::O_EXLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            #[cfg(not(target_os = "macos"))]
+            let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
             let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -261,11 +384,16 @@ impl InstanceFiles {
                 .mode(0o600)
                 .custom_flags(flags)
                 .open(&path)?;
+            // Linux cannot acquire flock atomically with open. A cleaner may
+            // acquire the new inode first and unlink it. Lock, then verify the
+            // named inode before authorizing socket bind. macOS O_EXLOCK needs
+            // the same recheck because the inode can become visible beforehand.
+            #[cfg(not(target_os = "macos"))]
+            fs2::FileExt::lock_exclusive(&lock)?;
             if same_lock(&lock, &path) {
                 return Ok(Self { lock, path });
             }
-            // Darwin can expose the inode before O_EXLOCK completes. A cleaner
-            // may win; never bind on that inode or reuse its instance ID.
+            // Never bind on an unlinked inode or reuse its instance ID.
             path = path.with_file_name(format!("{}.lock", random_id()?));
         }
         bail!("browser lock startup contention; reconnect extension")
@@ -394,28 +522,19 @@ pub(crate) fn serve(origin: &str) -> Result<()> {
             }
             Err(_) => bail!("browser listener failed"),
         };
-        // macOS accepted sockets inherit the listener's nonblocking flag.
-        if stream.set_nonblocking(false).is_err()
-            || verify_peer(&stream).is_err()
-            || stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .is_err()
-            || stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .is_err()
-        {
+        if verify_peer(&stream).is_err() {
             continue;
         }
         // Do not accept a payload until this host is ready to dispatch it. A
         // caller that times out in the backlog never sends a password.
-        if write_frame(&mut stream, br#"{"status":"ready"}"#).is_err() {
+        if write_socket_frame(&mut stream, br#"{"status":"ready"}"#).is_err() {
             continue;
         }
-        let Ok(bytes) = read_frame(&mut stream) else {
+        let Ok(bytes) = read_socket_frame(&mut stream, Duration::from_secs(2)) else {
             continue;
         };
         let Ok(fill) = validate_request(&bytes) else {
-            let _ = write_frame(&mut stream, br#"{"status":"rejected"}"#);
+            let _ = write_socket_frame(&mut stream, br#"{"status":"rejected"}"#);
             continue;
         };
         // Once dispatched, an interruption is uncertain. End this connection on timeout;
@@ -430,12 +549,12 @@ pub(crate) fn serve(origin: &str) -> Result<()> {
             None
         };
         let Some(response) = response else {
-            let _ = write_frame(&mut stream, br#"{"status":"outcome_unknown"}"#);
+            let _ = write_socket_frame(&mut stream, br#"{"status":"outcome_unknown"}"#);
             return Ok(());
         };
         let sanitized = sanitize_reply(&response, fill)
             .unwrap_or_else(|_| json!({"status":if fill {"outcome_unknown"} else {"rejected"}}));
-        let _ = write_frame(&mut stream, &serde_json::to_vec(&sanitized)?);
+        let _ = write_socket_frame(&mut stream, &serde_json::to_vec(&sanitized)?);
     }
 }
 fn connect(instance: &str, ready_timeout: Duration) -> Result<UnixStream> {
@@ -452,18 +571,16 @@ fn connect(instance: &str, ready_timeout: Duration) -> Result<UnixStream> {
     );
     // Refusal can also mean a full BSD listen backlog. Never unlink on
     // connection failure: it is not evidence that the owning host is dead.
-    let mut stream = UnixStream::connect(&path)
+    let deadline = Instant::now() + ready_timeout;
+    let mut stream = crate::session::connect_with_timeout(&path, ready_timeout)
         .map_err(|_| anyhow::anyhow!("browser bridge unavailable at {}", path.display()))?;
     verify_peer(&stream)?;
-    stream.set_read_timeout(Some(ready_timeout))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let ready = read_frame(&mut stream)
+    let ready = read_socket_frame_until(&mut stream, deadline)
         .map_err(|_| anyhow::anyhow!("browser bridge busy or unavailable; no request sent"))?;
     ensure!(
         &*ready == br#"{"status":"ready"}"#,
         "incompatible browser host; reconnect extension"
     );
-    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     Ok(stream)
 }
 pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
@@ -489,8 +606,11 @@ pub(crate) fn targets(rules: &[Value]) -> Result<Value> {
             continue;
         };
         let result = (|| -> Result<Value> {
-            write_frame(&mut stream, &request)?;
-            sanitize_reply(&read_frame(&mut stream)?, false)
+            write_socket_frame(&mut stream, &request)?;
+            sanitize_reply(
+                &read_socket_frame(&mut stream, Duration::from_secs(20))?,
+                false,
+            )
         })();
         let Ok(mut result) = result else {
             unavailable += 1;
@@ -543,37 +663,79 @@ pub(crate) fn fill(payload: &[u8]) -> Result<Value> {
     v["value"] = Value::Null;
     validate_request(&request)?;
     let result = (|| -> Result<Value> {
-        write_frame(&mut stream, &request)?;
-        sanitize_reply(&read_frame(&mut stream)?, true)
+        write_socket_frame(&mut stream, &request)?;
+        sanitize_reply(
+            &read_socket_frame(&mut stream, Duration::from_secs(20))?,
+            true,
+        )
     })();
     Ok(result.unwrap_or_else(|_| json!({"status":"outcome_unknown"})))
 }
 
-pub(crate) fn install(browser: &str, user_data_dir: Option<&Path>) -> Result<Value> {
-    ensure!(
-        cfg!(target_os = "macos"),
-        "browser host installation currently supports macOS only"
-    );
-    let vendor = match browser {
-        "chrome" => "Google/Chrome",
-        "chrome-beta" => "Google/Chrome Beta",
-        "chrome-canary" => "Google/Chrome Canary",
-        "chromium" => "Chromium",
-        "chrome-for-testing" => "Google/Chrome for Testing",
-        _ => bail!(
-            "supported browsers: chrome, chrome-beta, chrome-canary, chromium, chrome-for-testing"
-        ),
-    };
-    let home = browser_home()?;
-    let support = home.join("Library/Application Support");
-    let extension = support.join("Latch/browser-extension");
+// Keep browser installation independent of vault configuration. An explicit test
+// home also isolates XDG paths so synthetic tests cannot touch the real profile.
+fn installation_paths(browser: &str, user_data_dir: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
     if let Some(dir) = user_data_dir {
         ensure!(dir.is_absolute(), "user-data-dir must be absolute");
     }
+    let home = browser_home()?;
+    #[cfg(target_os = "macos")]
+    let (support, extension, vendor) = {
+        let vendor = match browser {
+            "chrome" => "Google/Chrome",
+            "chrome-beta" => "Google/Chrome Beta",
+            "chrome-canary" => "Google/Chrome Canary",
+            "chromium" => "Chromium",
+            "chrome-for-testing" => "Google/Chrome for Testing",
+            _ => bail!(
+                "supported browsers: chrome, chrome-beta, chrome-canary, chromium, chrome-for-testing"
+            ),
+        };
+        let support = home.join("Library/Application Support");
+        let extension = support.join("Latch/browser-extension");
+        (support, extension, vendor)
+    };
+    #[cfg(target_os = "linux")]
+    let (support, extension, vendor) = {
+        let vendor = match browser {
+            "chrome" => "google-chrome",
+            "chrome-beta" => "google-chrome-beta",
+            "chrome-dev" => "google-chrome-unstable",
+            "chromium" => "chromium",
+            "chrome-for-testing" => "google-chrome-for-testing",
+            _ => bail!(
+                "supported Linux browsers: chrome, chrome-beta, chrome-dev, chromium, chrome-for-testing"
+            ),
+        };
+        let support = if std::env::var_os("LATCH_BROWSER_HOME").is_some() {
+            home.join(".config")
+        } else {
+            xdg_config_home(&home, std::env::var_os("XDG_CONFIG_HOME"))?
+        };
+        let extension = support.join("latch-secrets/browser-extension");
+        (support, extension, vendor)
+    };
     let manifest_dir = user_data_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| support.join(vendor))
         .join("NativeMessagingHosts");
+    Ok((manifest_dir, extension))
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_config_home(home: &Path, value: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            ensure!(path.is_absolute(), "XDG_CONFIG_HOME must be absolute");
+            Ok(path)
+        }
+        None => Ok(home.join(".config")),
+    }
+}
+
+pub(crate) fn install(browser: &str, user_data_dir: Option<&Path>) -> Result<Value> {
+    let (manifest_dir, extension) = installation_paths(browser, user_data_dir)?;
     fs::create_dir_all(&manifest_dir)?;
     let manifest = manifest_dir.join(format!("{HOST}.json"));
     let contents = serde_json::to_vec_pretty(
@@ -624,7 +786,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
     #[test]
     fn cleanup_lock_lifecycle_and_foreign_entries() {
         use std::os::unix::fs::symlink;
@@ -683,7 +844,6 @@ mod tests {
         drop(replacement);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn cleanup_races_startup_and_other_cleaners() {
         let dir = tempfile::Builder::new()
@@ -728,6 +888,118 @@ mod tests {
             }
         });
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn slow_frame_trickle_cannot_extend_total_read_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            writer
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            writer.write_all(&64u32.to_ne_bytes()).unwrap();
+            for _ in 0..64 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let start = Instant::now();
+        assert!(read_socket_frame_until(&mut reader, start + Duration::from_millis(50)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(250));
+        drop(reader);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn slow_frame_reader_cannot_extend_total_write_deadline() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 4096;
+        // SAFETY: writer owns the socket and size is a valid c_int of the supplied size.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    writer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let receiver = std::thread::spawn(move || {
+            reader.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_millis(300);
+            let mut count = 0;
+            while Instant::now() < until {
+                match reader.read(&mut [0; 128]) {
+                    Ok(0) => break,
+                    Ok(size) => count += size,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(error) => panic!("unexpected socket read error: {error}"),
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            count
+        });
+        let start = Instant::now();
+        assert!(
+            write_socket_frame_until(
+                &mut writer,
+                &vec![b'x'; LIMIT],
+                start + Duration::from_millis(50)
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_millis(250));
+        drop(writer);
+        assert!(receiver.join().unwrap() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saturated_accept_queue_fails_before_sending_a_frame() {
+        let dir = tempfile::Builder::new()
+            .prefix("lb-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("blocked.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // SAFETY: listener is a live listening socket. Limit its queue to one
+        // pending connection (Linux permits backlog + 1); deliberately never accept.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued =
+            crate::session::connect_with_timeout(&path, Duration::from_millis(100)).unwrap();
+        let start = Instant::now();
+        assert!(crate::session::connect_with_timeout(&path, Duration::from_millis(50)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn peer_identity_is_verified_on_both_connected_endpoints() {
+        let (client, server) = UnixStream::pair().unwrap();
+        verify_peer(&client).unwrap();
+        verify_peer(&server).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_xdg_paths_require_absolute_overrides() {
+        let home = Path::new("/home/test");
+        assert_eq!(xdg_config_home(home, None).unwrap(), home.join(".config"));
+        assert_eq!(
+            xdg_config_home(home, Some("".into())).unwrap(),
+            home.join(".config")
+        );
+        assert_eq!(
+            xdg_config_home(home, Some("/custom/config".into())).unwrap(),
+            Path::new("/custom/config")
+        );
+        assert!(xdg_config_home(home, Some("relative".into())).is_err());
+        assert!(installation_paths("chrome-canary", None).is_err());
+        assert!(installation_paths("chromium", Some(Path::new("relative"))).is_err());
     }
 
     #[test]

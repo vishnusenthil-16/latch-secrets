@@ -6,7 +6,7 @@ Latch connects to Vaultwarden through the Bitwarden CLI, discovers vault items, 
 
 Authentication, encryption, and vault synchronization are handled by Bitwarden. Latch manages the local session and how credentials reach your tools.
 
-> **Project status:** Early v0, macOS only. Validated on Apple silicon with Bitwarden CLI 2026.8.0 and a disposable Vaultwarden 1.37.2 instance. See [validation](#validation) for the tested scope.
+> **Project status:** Early v0. macOS plus Linux x86-64/ARM64 implementations; Linux release qualification uses Debian 12 or newer. Physical Raspberry Pi behavior is not yet qualified. Historical macOS acceptance used Apple silicon, Bitwarden CLI 2026.8.0, and a disposable Vaultwarden 1.37.2 instance. See [validation](#validation) for the tested scope.
 
 [Quickstart](#quickstart) · [Usage](#usage) · [Command reference](#command-reference) · [Security](#security-model) · [Development](#development) · [License](#license)
 
@@ -16,22 +16,22 @@ Authentication, encryption, and vault synchronization are handled by Bitwarden. 
 - **Metadata-only discovery.** Find items by name without displaying their credentials.
 - **Subprocess injection.** Pass selected fields as environment variables without printing them.
 - **File injection.** Update a `.env` file or managed exports in `.zshrc`.
-- **Keychain sessions.** Reuse a session across terminal and SSH connections through a local macOS helper.
+- **Per-user sessions.** Reuse sessions through macOS Keychain, a Linux desktop Secret Service, or an explicitly selected Linux memory backend.
 - **Agent integration.** Structured JSON output and a thin usage skill, with authentication implemented in the CLI.
 
 ## Requirements
 
 | Component | Requirement |
 | --- | --- |
-| Platform | macOS with a logged-in desktop session |
-| Session storage | Unlocked login Keychain at `~/Library/Keychains/login.keychain-db` |
+| Platform | macOS desktop; Linux x86-64 or ARM64 with systemd user services |
+| Session storage | macOS login Keychain; Linux memory (default) or an unlocked Secret Service default collection |
 | Vault | A Vaultwarden account and an HTTPS server URL |
 | Bitwarden CLI | Separately installed `bw` **2026.8.0** |
 | Source builds | Current stable Rust with Edition 2024 support |
 
 Latch checks the exact `bw` version before vault operations. Version 2026.9.0 has a documented Vaultwarden login regression; see [upstream issue #7750](https://github.com/dani-garcia/vaultwarden/issues/7750). Latch does not bundle or update `bw`.
 
-Linux, Windows, relocated login Keychains, SSO, device approval, and email/password login with an OTP challenge are outside v0. Accounts using two-factor authentication can use the personal API-key login flow described below.
+Windows, 32-bit Linux, musl/Alpine, relocated login Keychains, SSO, device approval, and email/password login with an OTP challenge are outside this release. Accounts using two-factor authentication can use the personal API-key login flow described below.
 
 ## Installation
 
@@ -56,13 +56,19 @@ brew install vishnusenthil-16/tap/latch-secrets
 
 Install the supported `bw` version separately before configuring Latch. Maintainers can follow the [Homebrew release guide](packaging/homebrew/README.md) for automated stable releases.
 
+### Linux and 64-bit Raspberry Pi OS
+
+Use the architecture-specific archive described in the [Linux installation guide](packaging/linux/README.md), or build from source. Install the pinned native Bitwarden CLI separately. Desktop Secret Service mode needs a provider such as GNOME Keyring; memory mode has no desktop dependency.
+
 ## Quickstart
 
-Install Latch at a stable path, then run configuration from a logged-in macOS desktop session:
+Install Latch at a stable path. On macOS, configure from a logged-in desktop session. On Linux, use a normal user login with a running systemd user manager:
 
 ```sh
 # Replace the server URL and bw path with your installation details.
 latch configure --server https://vault.example.com --bw /absolute/path/to/bw
+# Linux defaults to memory. To choose explicitly, append --session-backend memory
+# or --session-backend secret-service for an unlocked desktop keyring.
 
 # Authenticate interactively, then refresh the local vault.
 latch login
@@ -80,7 +86,7 @@ latch run \
   -- deploy-tool
 ```
 
-For accounts requiring two-factor authentication, use `latch login --api-key`. It prompts for the master password and personal API credentials without echoing them. Latch does not store these credentials.
+For accounts requiring two-factor authentication, use `latch login --api-key`. It prompts for the master password and personal API credentials without echoing them. Latch does not write these inputs to its configuration, but the pinned Bitwarden CLI can persist the API client secret and authentication tokens in its own state. See the security model below.
 
 ## Usage
 
@@ -237,8 +243,8 @@ Use `--json` for machine-readable results. Never retrieve credentials into a con
 | Command | Purpose |
 | --- | --- |
 | `capabilities` | Describe the agent interface without configuration or authentication |
-| `configure` | Save connection settings and install or restart the desktop session helper |
-| `login` | Authenticate or unlock interactively and store the session in Keychain |
+| `configure` | Save connection settings and install or restart the per-user session helper |
+| `login` | Authenticate or unlock interactively and store the session in the selected backend |
 | `status` | Report configuration, session accessibility, vault state, and last sync |
 | `sync` | Refresh the local encrypted vault from the server |
 | `create` | Create a personal login item from strict JSON stdin |
@@ -271,9 +277,9 @@ Results use JSON on stdout: compact with `--json`, pretty-printed otherwise. Wit
 
 ## Configuration and troubleshooting
 
-Latch stores non-secret configuration and isolated Bitwarden state under `~/Library/Application Support/latch-secrets`. An absolute `--state-dir` selects another installation. Use a short path to fit macOS Unix socket limits. State directories must be owned by the current user with private permissions (`0700`); symlink paths are refused.
+Latch stores configuration and isolated Bitwarden state under `~/Library/Application Support/latch-secrets` on macOS, and `$XDG_STATE_HOME/latch-secrets` (default `~/.local/state/latch-secrets`) on Linux. An absolute `--state-dir` selects another installation. Both platforms keep the private socket at `<state>/session/broker.sock`, stable across SSH and desktop sessions; use a short state path to fit Unix socket limits. State directories must be owned by the current user with private permissions (`0700`); symlink paths are refused.
 
-`configure` creates Latch's own state and LaunchAgent. It does not import another wrapper's sessions or reuse existing Bitwarden state. Re-running it refreshes a reachable helper and repairs the backend endpoint when unauthenticated. Latch verifies Bitwarden’s actual server before authentication and vault operations; mismatched or reset backend state fails closed. Changing servers while authenticated is refused; use another state directory. A missing Bitwarden executable can be replaced by configuring another verified 2026.8.0 binary.
+`configure` creates Latch's own state and a LaunchAgent on macOS or a systemd user unit on Linux. It does not import another wrapper's sessions or reuse existing Bitwarden state. Re-running it refreshes a reachable helper and repairs the backend endpoint when unauthenticated. Latch verifies Bitwarden’s actual server before authentication and vault operations; mismatched or reset backend state fails closed. Changing servers while authenticated is refused; use another state directory. A missing Bitwarden executable can be replaced by configuring another verified 2026.8.0 binary.
 
 Start diagnosis with:
 
@@ -282,9 +288,13 @@ latch status --json
 latch doctor --json
 ```
 
-An inaccessible Keychain or missing desktop session prevents unattended access. A missing or invalid stored session requires interactive `latch login`. Competing vault operations return a busy error; retry when the other operation finishes. Backend execution is time-limited and responses are capped at 16 MiB.
+An inaccessible OS keyring prevents access in persistent-storage mode. Linux memory mode needs no desktop keyring, but loses the broker session whenever the helper exits. `doctor` reports the selected backend, service name, storage failure, and configuration recovery status. With an older macOS helper, it checks Keychain accessibility through an optional session read rather than trusting the legacy transport-only probe. A missing or invalid stored session requires interactive `latch login`. Competing vault operations return a busy error; retry when the other operation finishes. Backend execution is time-limited and responses are capped at 16 MiB.
 
 After upgrading a Homebrew installation, rerun `configure` while the existing helper is still running. It transfers a readable session through memory to the new helper. If the existing helper is unavailable or its Keychain cannot be read, configuration stops with recovery guidance. See the [upgrade notes](packaging/homebrew/README.md#runtime-dependency-and-upgrades) for the stable executable path and recovery procedure.
+
+On Linux, `configure --session-backend memory|secret-service` selects storage; omitting the option preserves the saved choice. There is no automatic fallback. Before changing backends, Latch reads and clears the old store; a locked persistent store prevents the change. Configuration is marked as pending before helper replacement. If replacement fails, `doctor` reports `configuration_recovery_pending`, vault operations are blocked, and rerunning `configure` with the saved settings repairs the service. A pending persistent configuration can be repaired with the saved backend and server even if its helper stopped; changing either first is refused so an earlier or timed-out write cannot be abandoned. Configuration reports success only after storage readiness is verified. Same-backend Secret Service restarts retain the existing item in its original collection, even if the default collection changed. Session transfer failure may require login again. No token is transferred when changing servers.
+
+An unavailable memory helper can be recreated by rerunning `configure`, then `login`. For an unavailable persistent helper, restore its service before reconfiguration so the old store can be cleared. Linux service lingering is an explicit user choice, never enabled automatically; see the [SSH and boot instructions](packaging/linux/README.md#ssh-and-boot).
 
 ## Browser password fill
 
@@ -297,7 +307,7 @@ latch browser targets --item ITEM_UUID --json
 latch browser fill --item ITEM_UUID --target HANDLE --selector 'input[type=password]' --json
 ```
 
-The macOS extension/native-host bridge preserves existing tabs and cookies. Targets
+The macOS/Linux extension/native-host bridge preserves existing tabs and cookies. Targets
 are short-lived, document-bound and single-use. Existing direct CDP delivery remains
 available with `--endpoint` (requires Node.js 22.4+).
 
@@ -307,7 +317,11 @@ unsupported destination policies are rejected. [Setup, policy, failures and limi
 
 ## Security model
 
-Bitwarden handles cryptography, authentication, encrypted vault storage, and server communication. Latch stores only the session in the login Keychain; it does not persist the master password or personal API credentials.
+Bitwarden handles cryptography, authentication, encrypted vault storage, and server communication. Latch keeps its copy of `BW_SESSION` in macOS Keychain, Linux Secret Service, or broker memory, according to configuration. It does not write the master password to configuration or a session file.
+
+**Memory mode applies only to the broker's session token.** The pinned Bitwarden CLI maintains `<state>/bw/data.json` and other state; authentication/access/refresh tokens and, for personal API-key login, the client secret can be persisted there. Those files are protected by the private state directory, but this is not a guarantee that all secret material is absent from disk. Memory can also be swapped by the OS. Before initializing Linux session storage, the broker disables process dumpability (`PR_SET_DUMPABLE=0`) and sets its core-size limit to zero; startup fails if either control cannot be applied. This covers piped core collectors as well as ordinary core files, but does not protect against a privileged debugger or swap. Helper exit is not `bw lock`, logout, cache erasure, or server-side revocation.
+
+The Linux desktop backend uses the authenticated per-user D-Bus and the Secret Service plain session protocol within the same-user trust boundary. Requests have an overall deadline and never invoke keyring prompts; unlock/create the default collection with the desktop's own tools. A timed-out mutation may have completed and must be inspected before retrying.
 
 The helper exposes a local Unix socket with a `0700` directory, a `0600` socket, and matching peer-UID checks. There is no TCP listener or plaintext session file. **All processes under the same OS account are trusted.** Latch does not isolate agents sharing an account or protect against root or a compromised same-user process.
 
@@ -334,6 +348,22 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 
 Automated tests cover metadata filtering, field selection, subprocess behavior, file formats and permissions, concurrency, session transport, and dependency compatibility. They use synthetic credentials, a fake Bitwarden process, and an in-memory session store.
 
+Linux desktop acceptance uses a disposable GNOME Keyring and private D-Bus, never the user's real keyring:
+
+```sh
+python3 scripts/check_linux_keyring.py --latch target/debug/latch
+```
+
+It checks storage, broker restart persistence, locked-store failure, provider restart with unlock, and deletion. Requires `dbus`, `gnome-keyring`, and `busctl`. The normal Linux Rust suite also exercises a private synthetic D-Bus provider for alias changes, prompt refusal, and stalled requests.
+
+On a disposable Linux machine with a running systemd user manager, exercise the real service lifecycle:
+
+```sh
+python3 scripts/check_linux_service.py --latch target/debug/latch --confirm-disposable-user-service
+```
+
+This creates and removes one temporary unit and uses a synthetic Bitwarden backend. It verifies managed-process identity, live transfer, restart loss, stopped-helper recovery, lock, and rejection of a conflicting foreground helper. It does not change lingering or access any existing vault.
+
 ### Mutation acceptance test
 
 Focused mutation coverage is included in `cargo test --locked --all-targets`: stdin validation and transport, metadata-only output, preservation, no-retry failures, and create → inject → rotate → inject flows against a synthetic backend.
@@ -349,13 +379,15 @@ This creates one uniquely named synthetic item, verifies values without printing
 
 ### Validation
 
-Local acceptance used synthetic credentials, the real pinned Bitwarden CLI, and a disposable Vaultwarden 1.37.2 instance. It covered login, sync, metadata-only discovery, subprocess and file injection, fresh SSH connections, helper restart, lock, and relogin. An isolated Keychain test verified prompt-free failure while locked and recovery after unlocking. A Homebrew-style binary-swap test replaced a running helper’s executable and recovered its session through `configure`.
+See the [Linux port validation record](packaging/linux/VALIDATION.md) for native Debian ARM64, keyring, systemd, browser, packaging evidence and remaining qualification limits.
+
+Historical macOS acceptance used synthetic credentials, the real pinned Bitwarden CLI, and a disposable Vaultwarden 1.37.2 instance. It covered login, sync, metadata-only discovery, subprocess and file injection, fresh SSH connections, helper restart, lock, and relogin. An isolated Keychain test verified prompt-free failure while locked and recovery after unlocking. A Homebrew-style binary-swap test replaced a running helper’s executable and recovered its session through `configure`.
 
 The local test server used a test-only TLS wrapper; production TLS settings were unchanged. Intel Macs and the new tag-triggered publishing workflow have not been exercised. Local Homebrew checks compile the source archive and exercise the formula’s fetch, install, and test hooks; they do not substitute for the tap’s native dependency-installation CI. Test your deployment before replacing an existing credentials workflow.
 
 Contributions should include focused verification for changed behavior. Keep account details, credentials, sessions, and private infrastructure configuration out of code, fixtures, issues, and pull requests. No minimum Rust version older than the current stable toolchain is promised yet.
 
-For packaging and release procedures, see the [Homebrew release guide](packaging/homebrew/README.md).
+For packaging and release procedures, see the [Homebrew release guide](packaging/homebrew/README.md) and [Linux release qualification](packaging/linux/README.md#release-qualification).
 
 ## License
 

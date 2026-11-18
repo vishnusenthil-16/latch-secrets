@@ -40,15 +40,19 @@ struct Cli {
 enum Action {
     /// Describe the agent interface without configuration or authentication.
     Capabilities,
-    /// Configure an isolated vault and install the macOS desktop session helper.
+    /// Configure an isolated vault and install its per-user session helper.
     Configure {
         #[arg(long)]
         server: String,
         /// Absolute path to a separately installed Bitwarden CLI 2026.8.0.
         #[arg(long)]
         bw: PathBuf,
+        /// Session storage: keychain (macOS), memory or secret-service (Linux).
+        /// Omitted on reconfigure: preserve the existing choice.
+        #[arg(long, value_enum)]
+        session_backend: Option<session::Backend>,
     },
-    /// Interactively authenticate/unlock; store only the session in login Keychain.
+    /// Interactively authenticate/unlock and store the session in the configured backend.
     Login {
         /// Use personal API credentials (useful for accounts with two-factor auth).
         #[arg(long)]
@@ -105,7 +109,10 @@ enum Action {
     /// Read-only dependency, configuration, and session checks.
     Doctor,
     #[command(hide = true)]
-    SessionServe,
+    SessionServe {
+        #[arg(long, value_enum)]
+        session_backend: Option<session::Backend>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -115,7 +122,7 @@ enum BrowserAction {
         #[arg(long)]
         item: String,
     },
-    /// Install the native host and unpacked extension (macOS; no vault access).
+    /// Install the native host and unpacked extension (macOS/Linux; no vault access).
     InstallHost {
         #[arg(long, default_value = "chrome")]
         browser: String,
@@ -194,51 +201,140 @@ fn execute(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     let state = config::State::new(cli.state_dir.clone())?;
-    if matches!(cli.command, Action::SessionServe) {
-        return session::serve(&state.root);
+    if let Action::SessionServe { session_backend } = &cli.command {
+        let selected = session_backend.unwrap_or_default();
+        selected.validate()?;
+        return session::serve(&state.root, selected);
     }
-    if let Action::Configure { server, bw } = &cli.command {
-        let proposed = config::Config::new(server, bw)?;
+    if let Action::Configure {
+        server,
+        bw,
+        session_backend,
+    } = &cli.command
+    {
+        let mut proposed = config::Config::new(server, bw)?;
         state.prepare()?;
         let _guard = state.lock(true)?;
+        let previous = if state.config_path().exists() {
+            Some(state.load()?)
+        } else {
+            None
+        };
+        proposed.session_backend = session_backend.unwrap_or_else(|| {
+            previous
+                .as_ref()
+                .map(|c| c.session_backend)
+                .unwrap_or_default()
+        });
+        proposed.session_backend.validate()?;
         let backend = bw::Bw::new(&proposed, &state);
         backend.check_version()?;
-        let previously_configured = state.config_path().exists();
-        let server_changed = if previously_configured {
-            state.load()?.server != proposed.server
-        } else {
-            true
-        };
-        let old_helper_running = session::probe(&state.root).is_ok();
+        let server_changed = previous
+            .as_ref()
+            .is_none_or(|c| c.server != proposed.server);
+        // Old macOS helpers predate the transport-only ping operation.
+        let old_helper_running =
+            session::ping(&state.root).is_ok() || session::probe(&state.root).is_ok();
+        if old_helper_running {
+            let expected = previous
+                .as_ref()
+                .map(|c| c.session_backend)
+                .unwrap_or(proposed.session_backend);
+            ensure!(
+                helper_backend_matches(&state, expected),
+                "running helper does not match the saved session backend; stop the mismatched helper, restore the saved backend's service, and retry configure before changing storage or servers"
+            );
+        }
+        // An unavailable memory helper contains no surviving token. Persistent
+        // stores need their old helper to authorize deletion before replacement.
         ensure!(
-            !previously_configured || old_helper_running,
-            "existing session helper is unavailable; restore its LaunchAgent before reconfiguring, or use a new --state-dir and log in again"
+            previous.as_ref().is_none_or(|c| {
+                c.session_backend == session::Backend::Memory
+                    || (c.recovery_pending
+                        && c.session_backend == proposed.session_backend
+                        && !server_changed)
+            }) || old_helper_running,
+            "existing session helper is unavailable; recover the saved persistent backend and server before switching storage or servers, or use a new --state-dir and log in again"
         );
+        // A Secret Service item is not tied to executable identity. Preserve
+        // it on a same-backend/server restart, including when its collection is
+        // no longer the default. Keychain upgrades still require handoff.
+        let preserve_store = old_helper_running
+            && !server_changed
+            && proposed.session_backend == session::Backend::SecretService
+            && previous.as_ref().is_some_and(|c| {
+                c.session_backend == proposed.session_backend && !c.recovery_pending
+            });
+        if old_helper_running {
+            let source_backend = previous
+                .as_ref()
+                .map(|c| c.session_backend)
+                .unwrap_or(proposed.session_backend);
+            let source_ready = if source_backend == proposed.session_backend && !server_changed {
+                check_session_storage(&state, source_backend)
+            } else {
+                // Leaving an empty store requires readable absence and verified
+                // deletion, not a default collection for creating a new item.
+                session::get_optional(&state.root).map(|token| {
+                    let _token = Zeroizing::new(token);
+                })
+            };
+            source_ready.context(
+                "existing session storage is unavailable; unlock or repair it before reconfiguring",
+            )?;
+        }
         backend.configure_server(server_changed)?;
-        // Source-built executables have different Keychain signing identities.
-        // Let the running old helper read and delete its own entry, then let the
-        // new helper recreate it. Keep the session only in zeroized memory.
-        let previous_session = if old_helper_running && !server_changed {
+        let previous_session = if old_helper_running
+            && !preserve_store
+            && !server_changed
+            && !previous.as_ref().is_some_and(|c| c.recovery_pending)
+        {
             session::get_optional(&state.root)
-                .context("could not read existing session; unlock Keychain or recover the old helper before reconfiguring")?
+                .context("could not read existing session; unlock its storage and retry configure")?
                 .map(Zeroizing::new)
         } else {
             None
         };
-        if old_helper_running {
-            // Confirm deletion/absence through the old helper before stopping it,
-            // including when changing servers (whose session must not transfer).
-            session::delete(&state.root)
-                .context("could not prepare helper upgrade; unlock Keychain and retry configure")?;
+        if old_helper_running && !preserve_store {
+            session::delete(&state.root).context(
+                "could not clear previous session storage; unlock it and retry configure",
+            )?;
         }
-        session::install(&state.root)
-            .context("could not restart helper; run configure again, then login if needed")?;
+        // Persist the selected backend before starting the replacement. If
+        // replacement fails, configuration describes the requested recovery
+        // target, never the already-cleared old store. No token goes to disk.
+        proposed.recovery_pending = true;
+        state.save(&proposed).context(
+            "could not save configuration; repair configuration before retrying, then check session status",
+        )?;
+        session::install(&state.root, proposed.session_backend)
+            .context("configuration saved but helper installation failed; repair the user service, rerun configure with the same options, then login")?;
+        ensure!(
+            helper_backend_matches(&state, proposed.session_backend),
+            "replacement helper has the wrong backend; configuration recovery is pending, repair the service and rerun configure"
+        );
+        // A newly selected persistent backend can contain an older session for
+        // this state path. Clear it before admitting only the verified handoff.
+        if !preserve_store {
+            session::delete(&state.root).context(
+                "replacement session storage could not be cleared; unlock it, rerun configure to complete recovery, then login")?;
+        }
         if let Some(token) = previous_session {
             session::put(&state.root, &token)
-                .context("helper restarted but session transfer failed; run login again")?;
+                .context("helper replaced but session transfer failed; rerun configure to complete recovery, then login")?;
         }
-        state.save(&proposed)?;
-        output(json!({"configured":true,"helper_installed":true}), cli.json);
+        check_session_storage(&state, proposed.session_backend).context(
+            "configured session storage is unavailable; unlock or create its default keyring, then rerun configure with the saved settings")?;
+        proposed.recovery_pending = false;
+        state
+            .save(&proposed)
+            .context("helper installed but completion could not be saved; rerun configure")?;
+        output(
+            json!({"configured":true,"helper_installed":true,"helper_service":session::service_name(&state.root)?,
+            "session_backend":proposed.session_backend,
+            "session_persistence":session_persistence(proposed.session_backend)}),
+            cli.json,
+        );
         return Ok(());
     }
     if matches!(cli.command, Action::Status | Action::Doctor) && !state.config_path().exists() {
@@ -259,33 +355,60 @@ fn execute(cli: &Cli) -> Result<()> {
     let backend = bw::Bw::new(&config, &state);
     // Lock must still delete persisted sessions if the dependency has gone missing.
     if matches!(cli.command, Action::Lock) {
+        let backend_matches = helper_backend_matches(&state, config.session_backend);
         let deleted = session::delete(&state.root);
         let locked = backend.call(&["lock"], None);
         ensure!(
-            deleted.is_ok() && locked.is_ok(),
-            "lock incomplete: session deletion or bw lock failed; check helper and dependency with doctor"
+            backend_matches && deleted.is_ok() && locked.is_ok(),
+            "lock incomplete: helper identity, session deletion, or bw lock failed; check helper and dependency with doctor"
         );
         output(json!({"locked":true}), cli.json);
         return Ok(());
     }
     if matches!(cli.command, Action::Doctor) {
         let dependency = backend.check_version().is_ok();
-        let helper = session::probe(&state.root).is_ok();
-        let stored = session::get(&state.root).ok().map(Zeroizing::new);
-        let status = if dependency {
+        let helper = session::ping(&state.root).is_ok() || session::probe(&state.root).is_ok();
+        let storage = check_session_storage(&state, config.session_backend);
+        let backend_matches = helper_backend_matches(&state, config.session_backend);
+        let stored = if backend_matches && !config.recovery_pending {
+            session::get(&state.root).ok().map(Zeroizing::new)
+        } else {
+            None
+        };
+        let status = if dependency && backend.status(None).is_ok() {
             backend.status(stored.as_deref().map(|s| s.as_str())).ok()
         } else {
             None
         };
         let ready = helper
+            && storage.is_ok()
+            && backend_matches
+            && !config.recovery_pending
             && dependency
             && status.as_ref().and_then(|s| s["status"].as_str()) == Some("unlocked");
         output(
             json!({"configured":true,"supported_bw":dependency,"helper_reachable":helper,
+            "session_backend":config.session_backend,
+            "helper_service":session::service_name(&state.root).ok(),
+            "helper_backend_matches":backend_matches,"configuration_recovery_pending":config.recovery_pending,
+            "session_persistence":session_persistence(config.session_backend),
+            "storage_accessible":storage.is_ok(),
+            "storage_error":storage.err().map(|e|e.to_string()),
             "session_accessible":stored.is_some(),"vault_status":status.as_ref().and_then(|s|s["status"].as_str()),"ready":ready}),
             cli.json,
         );
         return Ok(());
+    }
+    let backend_matches = helper_backend_matches(&state, config.session_backend);
+    if !matches!(cli.command, Action::Status) {
+        ensure!(
+            !config.recovery_pending,
+            "configuration recovery is incomplete; rerun configure with the saved server, bw path, and session backend"
+        );
+        ensure!(
+            backend_matches,
+            "session helper unavailable, incompatible, or using a different backend; rerun configure to repair it, then login"
+        );
     }
     backend.check_version()?;
     // Check the actual backend endpoint before prompting or resolving credentials.
@@ -293,10 +416,16 @@ fn execute(cli: &Cli) -> Result<()> {
     let initial_status = backend.status(None)?;
     match &cli.command {
         Action::Status => {
-            let token = session::get(&state.root).ok().map(Zeroizing::new);
+            let token = if backend_matches && !config.recovery_pending {
+                session::get(&state.root).ok().map(Zeroizing::new)
+            } else {
+                None
+            };
             let status = backend.status(token.as_deref().map(|s| s.as_str()))?;
             output(
-                json!({"configured":true,"session_accessible":token.is_some(),
+                json!({"configured":true,"session_backend":config.session_backend,
+                "session_persistence":session_persistence(config.session_backend),"session_accessible":token.is_some(),
+                "configuration_recovery_pending":config.recovery_pending,"helper_backend_matches":backend_matches,
                 "vault_status":status["status"],"last_sync":status["lastSync"]}),
                 cli.json,
             );
@@ -307,7 +436,7 @@ fn execute(cli: &Cli) -> Result<()> {
                 "login requires an interactive terminal"
             );
             session::probe(&state.root).context(
-                "session helper unavailable; run configure from a logged-in desktop session",
+                "session storage unavailable; check doctor and repair the configured user service or unlock its keyring",
             )?;
             let status = initial_status;
             let password = Zeroizing::new(
@@ -342,7 +471,7 @@ fn execute(cli: &Cli) -> Result<()> {
             if session::put(&state.root, &token).is_err() {
                 let _ = session::delete(&state.root);
                 let _ = backend.call(&["lock"], None);
-                bail!("could not store session in Keychain; login did not complete");
+                bail!("could not store session in the configured backend; login did not complete");
             }
             output(
                 json!({"authenticated":true,"session_stored":true}),
@@ -487,4 +616,40 @@ fn run_child(command: &[OsString], values: Vec<(String, String)>) -> Result<()> 
     child.envs(values);
     let error = child.exec();
     Err(error).context("could not execute child command")
+}
+
+fn session_persistence(backend: session::Backend) -> &'static str {
+    match backend {
+        session::Backend::Memory => {
+            "BW_SESSION only: until helper exits; Bitwarden authentication/cache state remains on disk"
+        }
+        _ => {
+            "BW_SESSION in OS credential store; Bitwarden authentication/cache state remains on disk"
+        }
+    }
+}
+
+fn helper_backend_matches(state: &config::State, selected: session::Backend) -> bool {
+    match session::info(&state.root) {
+        Ok(info) => info["backend"].as_str() == Some(selected.as_str()),
+        // Upgrade compatibility for the original macOS-only broker protocol.
+        Err(_) if cfg!(target_os = "macos") && selected == session::Backend::Keychain => {
+            session::probe(&state.root).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+fn check_session_storage(state: &config::State, selected: session::Backend) -> Result<()> {
+    if cfg!(target_os = "macos")
+        && selected == session::Backend::Keychain
+        && session::info(&state.root).is_err()
+    {
+        // The original macOS broker's probe is transport-only. An optional
+        // read distinguishes accessible-but-empty Keychain from a locked store.
+        let _session = Zeroizing::new(session::get_optional(&state.root)?);
+        Ok(())
+    } else {
+        session::probe(&state.root)
+    }
 }

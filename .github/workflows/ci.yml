@@ -36,3 +36,42 @@ jobs:
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           python3 scripts/prepare_release.py --tag "v$VERSION" --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/latch-snapshot" --snapshot
           brew ruby scripts/check_homebrew.rb "$RUNNER_TEMP/latch-snapshot"
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    # Build and execute against the advertised Debian 12 / glibc 2.36 baseline.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 dbus systemd libsecret-tools gnome-keyring zsh
+          rustup component add rustfmt clippy
+      - name: Validate Linux code and packaging
+        run: |
+          cargo fmt --check
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Real isolated desktop keyring acceptance
+        run: python3 scripts/check_linux_keyring.py --latch target/debug/latch
+      - name: Verify pinned native Bitwarden dependency
+        run: python3 scripts/check_linux_dependencies.py --target '${{ matrix.target }}'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Actual extension and native-host delivery (synthetic credentials)
+        working-directory: prototypes/browser-fill
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm test

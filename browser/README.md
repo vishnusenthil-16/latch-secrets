@@ -6,7 +6,7 @@ It never submits, navigates, retries or returns a password.
 
 ## Existing Chrome profiles (default transport)
 
-The macOS native bridge uses your existing profile, tabs and cookies. It requires
+The macOS and Linux native bridge uses your existing profile, tabs and cookies. It requires
 Chrome 106+ (or a compatible Chromium browser), the Latch extension and native host.
 No remote-debugging port or Node.js is required for this transport.
 
@@ -16,7 +16,8 @@ latch browser install-host --browser chrome --json
 
 1. Open `chrome://extensions`, enable Developer mode, choose **Load unpacked** and
    select the returned `extension_path` (normally
-   `~/Library/Application Support/Latch/browser-extension`).
+   `~/Library/Application Support/Latch/browser-extension` on macOS or
+   `${XDG_CONFIG_HOME:-~/.config}/latch-secrets/browser-extension` on Linux).
 2. Open the extension popup. Enter an HTTPS site and select **Allow site**. Repeat
    for each intended site; access is not granted to all websites by default.
 3. Set a recognizable profile label, e.g. “Personal Chrome”. Install/enable the
@@ -43,8 +44,13 @@ reconnection invalidate them. Get fresh targets when rejected as stale; never re
 an uncertain fill automatically. `unavailable_connections` reports partial discovery
 failures. An empty list can mean no matching page or no site permission.
 
-Supported installer names: `chrome`, `chrome-beta`, `chrome-canary`, `chromium`,
-`chrome-for-testing`. For a nonstandard user-data root, add
+Supported installer names: `chrome`, `chrome-beta`, `chromium`, and
+`chrome-for-testing`; macOS also supports `chrome-canary`, Linux supports
+`chrome-dev`. On Linux, the default Chrome and Chromium manifests are under
+`${XDG_CONFIG_HOME:-~/.config}/google-chrome/NativeMessagingHosts` and
+`${XDG_CONFIG_HOME:-~/.config}/chromium/NativeMessagingHosts`, respectively.
+An explicitly set `XDG_CONFIG_HOME` must be absolute. Use a native distribution
+package; Snap/Flatpak browser sandbox integration is not qualified by this installer. For a nonstandard user-data root, add
 `--user-data-dir /absolute/path/to/browser-data` (not its `Default`/`Profile N` child).
 The installer writes a host manifest pointing at this Latch executable and extracts
 the bundled extension. Re-run it after moving/upgrading Latch, reload the extension,
@@ -54,9 +60,13 @@ folders; Chrome-launched executables there can be blocked by macOS privacy contr
 Chrome starts the host when the extension connects. The same binary creates a
 random socket in `<OS-account-home>/.latch-browser` (0700 directory, 0600 socket, same-UID peer
 checks). The OS account database supplies the home for both discovery and installation;
-agent overrides of `HOME` do not affect it. Synthetic tests can explicitly set
+agent overrides of `HOME` do not affect it. The runtime directory deliberately
+stays stable across GUI and SSH environments rather than following a possibly
+different `XDG_RUNTIME_DIR`. Linux uses `SO_PEERCRED` on both socket endpoints;
+macOS uses `getpeereid`. Synthetic tests can explicitly set
 `LATCH_BROWSER_HOME` to the same absolute directory for CLI and Chrome. Socket
-paths must fit macOS’s 104-byte limit (home paths up to 51 bytes). Clients wait for a host-ready
+paths must fit the platform Unix socket limit (104 bytes on macOS, 108 on Linux);
+long home paths can exceed it. Clients wait for a host-ready
 handshake before sending a password, so a request that times out while queued
 cannot later fill. Once dispatched, a timeout is still `outcome_unknown`; never
 retry automatically. No separate daemon, credentials service or MCP server is installed. A
@@ -68,7 +78,9 @@ target discovery automatically remove abandoned instances using OS-held locks.
 Busy or suspended hosts are never removed; connection failures do not trigger deletion.
 Older sockets without lockfiles remain manual-cleanup-only, after closing all browser profiles.
 Cleanup is best-effort and runs on next use, not in a background service.
-Discovery waits up to two seconds per host for readiness and reports unavailable connections. Enterprise policies may prohibit unpacked extensions or native messaging.
+Discovery gives each host a two-second connection/readiness budget and reports unavailable
+connections. Socket frames have absolute header-and-body deadlines; a full accept
+queue or slow trickle cannot extend the timeout indefinitely. Enterprise policies may prohibit unpacked extensions or native messaging.
 
 To uninstall: remove the extension from each profile, remove the exact native-host
 manifest path returned by installation, and remove the extracted extension directory
@@ -171,7 +183,17 @@ filling, replay/navigation/visibility rejection; unit fixtures
 also cover expiry, inactive documents, exact URL changes and uncertain script results.
 Existing CDP tests cover frames, sandboxed origins, field heuristics and page readback.
 No test reads a real vault or installs anything in your normal Chrome profile.
-The integration suite currently runs on macOS, matching Latch's supported platform.
+The same suite is intended for macOS and Linux. To qualify a distribution's native
+Chromium package, including Raspberry Pi OS, run the real-extension test with:
+
+```sh
+LATCH_TEST_CHROMIUM_EXECUTABLE=/usr/bin/chromium node --test bridge.test.mjs
+```
+
+Run that command from `prototypes/browser-fill` after building Latch and installing
+its npm test dependencies. The executable must be an absolute path. This exercises
+that exact browser with a disposable profile and synthetic credential; a cross-build
+or Playwright browser run on another OS does not qualify the Pi browser package.
 
 ## Protocol and maintenance
 
@@ -185,7 +207,7 @@ external extension messaging, content script or web-accessible resource is expos
 The extension's public manifest key pins the development ID. It is not a secret;
 there is no private signing key in this repository. A future Web Store release must
 keep the extension ID, compiled origin and host allowlist aligned. This change does
-not publish a Web Store listing or implement Windows/Linux native-host installation.
+not publish a Web Store listing or implement Windows native-host installation.
 
 Chrome references: [native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging),
 [document-targeted scripting](https://developer.chrome.com/docs/extensions/reference/api/scripting).

@@ -12,6 +12,10 @@ use std::{
 pub(crate) struct Config {
     pub server: String,
     pub bw: PathBuf,
+    #[serde(default)]
+    pub session_backend: crate::session::Backend,
+    #[serde(default)]
+    pub recovery_pending: bool,
 }
 impl Config {
     pub fn new(server: &str, bw: &Path) -> Result<Self> {
@@ -31,6 +35,8 @@ impl Config {
         Ok(Self {
             server: url.as_str().trim_end_matches('/').to_owned(),
             bw,
+            session_backend: crate::session::Backend::default(),
+            recovery_pending: false,
         })
     }
 }
@@ -42,10 +48,7 @@ impl State {
     pub fn new(root: Option<PathBuf>) -> Result<Self> {
         let root = match root {
             Some(root) => root,
-            None => PathBuf::from(
-                std::env::var_os("HOME").context("HOME is unavailable; pass --state-dir")?,
-            )
-            .join("Library/Application Support/latch-secrets"),
+            None => default_root()?,
         };
         ensure!(root.is_absolute(), "state directory must be absolute");
         ensure!(
@@ -131,6 +134,7 @@ impl State {
                 && config.bw.is_absolute(),
             "invalid configuration"
         );
+        config.session_backend.validate()?;
         Ok(config)
     }
     pub fn save(&self, config: &Config) -> Result<()> {
@@ -167,4 +171,26 @@ fn private_file(file: &File) -> Result<()> {
         "state files must be single-link owner-only regular files"
     );
     Ok(())
+}
+
+fn default_root() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|p| !p.is_empty()) {
+            let path = PathBuf::from(path);
+            ensure!(path.is_absolute(), "XDG_STATE_HOME must be absolute");
+            return Ok(path.join("latch-secrets"));
+        }
+        Ok(PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unavailable; pass --state-dir")?,
+        )
+        .join(".local/state/latch-secrets"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unavailable; pass --state-dir")?,
+        )
+        .join("Library/Application Support/latch-secrets"))
+    }
 }

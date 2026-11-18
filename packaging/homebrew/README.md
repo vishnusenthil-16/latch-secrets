@@ -1,6 +1,6 @@
 # macOS Homebrew releases
 
-This pipeline publishes stable source releases and updates the Homebrew tap when a new stable tag is pushed. It does not build bottles, install Bitwarden, or activate Latch's session helper.
+The shared release pipeline publishes a source archive for macOS Homebrew plus Linux x86-64/ARM64 binary archives, and updates the Homebrew tap when a new stable tag is pushed. This guide covers its macOS path; see the [Linux guide](../linux/README.md) for Linux installation and qualification. It does not build bottles, install Bitwarden, or activate Latch's session helper.
 
 ## Local preparation and validation
 
@@ -9,7 +9,7 @@ Python 3.11+, a current Rust toolchain, and Homebrew 6+ are required for the pac
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/prepare_release.py \
-  --tag v0.1.0 --repository vishnusenthil-16/latch-secrets \
+  --tag v0.5.0 --repository vishnusenthil-16/latch-secrets \
   --output target/homebrew-snapshot --snapshot
 HOMEBREW_DEVELOPER=1 HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 \
   brew ruby scripts/check_homebrew.rb target/homebrew-snapshot
@@ -19,7 +19,7 @@ Use a new/empty output directory for each run. The snapshot mode permits an unco
 
 The check uses Homebrew's formula loader, archive checksum verification, and actual `fetch`, `install`, and `test` methods. It compiles the packaged source and runs the resulting executable in a temporary prefix, using the invoking Rust toolchain. It also checks that the thin skill was installed. It does not install Rust through Homebrew, modify the Cellar, register a tap, install a LaunchAgent, or access Keychain. A hosted tap CI workflow covers the full `brew install` dependency path separately.
 
-Outputs:
+Source-preparation outputs (before the shared workflow adds Linux archives):
 
 - `latch-secrets-X.Y.Z.tar.gz`: deterministic source archive with `Cargo.lock`.
 - `Formula/latch-secrets.rb`: real release URL and computed SHA-256.
@@ -40,9 +40,9 @@ Create a fine-grained personal access token for the tap repository only, with **
 
 1. Merge the release workflow, Homebrew workflow, and scripts to the source repository's default branch before creating the next tag. GitHub executes the workflow files from the tag commit.
 2. Change `Cargo.toml` to the intended stable `X.Y.Z` version. Run `cargo check` to refresh the package version in `Cargo.lock`; commit both files and all release inputs, then let CI pass. The tag must match this version exactly and point at the commit to publish.
-3. Create and push the stable `vX.Y.Z` tag. That push runs `.github/workflows/release.yml` automatically. It tests Rust and Python, builds and verifies four deterministic assets, exercises the formula on macOS, publishes a stable GitHub release, then directly calls the reusable Homebrew workflow. The tap job validates the published assets against the same tag before pushing `Formula/latch-secrets.rb` to the tap's default branch.
+3. Create and push the stable `vX.Y.Z` tag. That push runs `.github/workflows/release.yml` automatically. It tests Rust and Python, builds and verifies the source bundle and both native Linux archives, exercises the formula on macOS, publishes a stable GitHub release, then directly calls the reusable Homebrew workflow. The tap job validates the published assets against the same tag before pushing `Formula/latch-secrets.rb` to the tap's default branch.
 
-The workflow never creates or moves a tag. It creates a draft release, uploads any missing assets, verifies all four, then publishes it. On retry, an existing draft or published release can be completed only if every existing expected asset is byte-identical to the newly verified bundle; differing, duplicate, or unexpected assets fail without replacement. Prereleases are refused. The tap update is also repeatable: identical formula bytes succeed, a different formula at the same version or an older version fails. Use a new version for changes. The manually bootstrapped `v0.1.0` tap formula has an audit-only edit relative to its immutable release asset, so retrying its tap step will deliberately report a same-version mismatch; the next version advances normally.
+The workflow never creates or moves a tag. It creates a draft release, uploads any missing assets, verifies the complete asset inventory, then publishes it. On retry, an existing draft or published release can be completed only if every existing expected asset is byte-identical to the newly verified bundle; differing, duplicate, or unexpected assets fail without replacement. Prereleases are refused. The tap update is also repeatable: identical formula bytes succeed, a different formula at the same version or an older version fails. Use a new version for changes. The manually bootstrapped `v0.1.0` tap formula has an audit-only edit relative to its immutable release asset, so retrying its tap step will deliberately report a same-version mismatch; the next version advances normally.
 
 For recovery, manually dispatch `release.yml` with the existing tag to retry the entire sequence, or `homebrew.yml` with the tag and tap repository to retry just the tap stage after the stable release is public. These recovery paths apply to tags that contain this pipeline; `v0.1.0` predates the publishing scripts and was bootstrapped manually. Do not use a release event to chain these jobs: releases created with `GITHUB_TOKEN` do not start a new release-triggered workflow. The direct reusable-workflow call guarantees the tap stage runs after publication.
 
@@ -60,12 +60,12 @@ The formula builds `latch` and installs the usage skill under its shared-data di
 
 For a Homebrew installation, `configure` selects `<brew-prefix>/opt/latch-secrets/bin/latch` for its LaunchAgent only if that stable path resolves to the running binary. It fails with repair guidance for an incorrect/missing `opt` link. Source/Cargo installations retain their actual executable path.
 
-Upgrading the formula does not restart the running helper. Rerun `latch configure --server ... --bw ...` while that helper remains available. macOS binds source-built Keychain items to the executable identity, so `configure` reads the session through the old helper, removes the old item, starts the new helper, and recreates the item. The transfer stays in process memory; `configure` zeroizes its retained copy. A failure after removal may require interactive login; no master password is stored for automatic recovery.
+Upgrading the formula does not restart the running helper. Rerun `latch configure --server ... --bw ...` while that helper remains available. macOS binds source-built Keychain items to the executable identity, so `configure` reads the session through the old helper, removes the old item, starts the new helper, and recreates the item. The transfer stays in process memory; `configure` zeroizes its retained copy. A failure after removal may require rerunning configure to complete the saved recovery state, then interactive login; no master password is stored by Latch for automatic recovery.
 
 This path passed a live macOS test with different debug/release executables: the old Cellar directory was removed, the `opt` link changed, and the new helper recovered the session. Fresh SSH access and locked-Keychain failure/recovery were also exercised separately.
 
-For a planned upgrade where the old helper cannot remain running, run `latch lock` before upgrading, then restart the existing LaunchAgent from the desktop session, configure, and log in again. For an existing installation, `configure` refuses to replace an unavailable helper. Restore its existing LaunchAgent first, or choose a new private `--state-dir` and authenticate there.
+For a planned upgrade where the old helper cannot remain running, run `latch lock` before upgrading, then restart the existing LaunchAgent from the desktop session, configure, and log in again. For an existing persistent installation without a pending recovery, `configure` refuses to replace an unavailable helper. Restore its existing LaunchAgent first, or choose a new private `--state-dir` and authenticate there.
 
 If an earlier development build left an item that its replacement cannot read, use Keychain Access to remove only the Latch session item for that state directory, restart its existing LaunchAgent with the new executable, then configure and log in again. The service is `com.latch-secrets.session`; the account is `uid:<uid>:<hex-encoded absolute state path>`. Do not delete the login Keychain or other applications’ items. Older unreleased broker protocols may also require this recovery; automatic migration from development snapshots is not guaranteed.
 
-macOS is the only supported release platform. Native source builds avoid a separate ARM/Intel binary matrix; each architecture still needs runtime validation before claiming support. Bottles and signing/notarization are outside this first pipeline.
+Homebrew remains macOS-only; Linux uses the separate x86-64 and ARM64 binary archives. macOS source builds avoid a separate ARM/Intel binary matrix, but each architecture still needs runtime validation before claiming support. Bottles and signing/notarization remain outside this pipeline. See the [validation record](../linux/VALIDATION.md) for tested platforms and remaining limits.
