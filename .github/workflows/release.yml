@@ -75,6 +75,10 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Trust the Actions checkout in the build container
+        # checkout configures Git in its action HOME, which differs from the
+        # shell HOME in this container. Trust only this job's known checkout.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install packaging tools
         run: |
           apt-get update
