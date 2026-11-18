@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {chromium} from 'playwright';
+import {waitForDevToolsEndpoint} from './cdp-ready.mjs';
 const source = (await readFile(new URL('../../browser/extension/fill.js',import.meta.url),'utf8')).replace(/^export /, '');
 const driver = source + await readFile(new URL('../../browser/driver.mjs',import.meta.url),'utf8');
 
@@ -19,15 +20,16 @@ const run = payload => new Promise((resolve,reject)=>{
 
 test('supported bundled driver: CDP, policy, visibility, metadata-only and no submit',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'latch-supported-'));
- const context=await chromium.launchPersistentContext(dir,{headless:true,args:['--remote-debugging-port=0']});
+ // Use full Chromium's new headless mode, not the separate headless shell.
+ const context=await chromium.launchPersistentContext(dir,{channel:'chromium',headless:true,args:['--remote-debugging-port=0']});
  try {
-  const [port,path]=(await readFile(join(dir,'DevToolsActivePort'),'utf8')).trim().split('\n');
+  const endpoint=await waitForDevToolsEndpoint(dir);
   const page=context.pages()[0];
   await page.route('https://fixture.test/**',r=>r.fulfill({contentType:'text/html',body:'<input id="p" type="password">'}));
   await page.goto('https://fixture.test/login');
   const cdp=await context.newCDPSession(page);
   const {targetInfo}=await cdp.send('Target.getTargetInfo');
-  const base={endpoint:`ws://127.0.0.1:${port}${path}`,target:targetInfo.targetId,rules,selector:'#p',value:'synthetic-supported-canary'};
+  const base={endpoint,target:targetInfo.targetId,rules,selector:'#p',value:'synthetic-supported-canary'};
   const check=async(payload,code)=>assert.deepEqual(await run(payload),{code,stdout:'',stderr:''});
   await check({...base,target:'missing'},10);
   await check({...base,rules:[{origin:'https://wrong.test',exact:null}]},10);
